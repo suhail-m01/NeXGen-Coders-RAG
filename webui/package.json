@@ -1,0 +1,20 @@
+{
+  "name": "evidence-ai-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "React front end for Evidence AI. Builds to static files that the FastAPI process serves at /ui, so a deployment exposes one port.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11"
+  }
+}
