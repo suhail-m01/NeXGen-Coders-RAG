@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Evidence AI
 
 **Offline-runtime multimodal Retrieval-Augmented Generation over documents, images and audio.**
@@ -661,3 +662,7 @@ document Q&A, document→media discovery, abstention, and direct image inspectio
 ---
 
 *Demo data is synthetic and clearly labelled. "Project Alpha" is fictional.*
+=======
+# NeXGen-Coder-s--
+offline multimodal System using RAG Architecture 
+>>>>>>> origin/main
