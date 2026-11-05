@@ -298,6 +298,7 @@ class RAGPipeline:
         expansion, the abstention gate -- is identical on both backends.
         """
         from citations import build_citations
+        from grounding_audit import build_grounding_ledger
         from llm import pick_inspectable_image
         from providers import ProviderError, get_provider, supports_vision
         from relationships import compute_related_to, expand_evidence
@@ -432,7 +433,29 @@ class RAGPipeline:
         # 8. Programmatic citations
         mark = time.perf_counter()
         citations, _sentence_map = build_citations(answer, final_evidence, filenames)
+        ledger = build_grounding_ledger(answer, _sentence_map)
         timings["citations_ms"] = (time.perf_counter() - mark) * 1000
+
+        # Fail closed: if any answer sentence has no qualifying citation,
+        # do not return it as a grounded answer.
+        if ledger.status != "complete":
+            logger.warning(
+                "Grounding audit rejected answer: %s/%s sentences cited",
+                ledger.supported_sentences,
+                ledger.total_sentences,
+            )
+            timings["total_ms"] = (time.perf_counter() - started) * 1000
+            return QueryResponse(
+                answer=ABSTENTION_MESSAGE,
+                citations=[],
+                retrieved_items=reranked,
+                relationships=relationships,
+                abstained=True,
+                confidence=confidence,
+                error_code=ErrorCode.INSUFFICIENT_EVIDENCE,
+                query_representation=representation,
+                latency_ms=timings,
+            )
         timings["total_ms"] = (time.perf_counter() - started) * 1000
 
         return QueryResponse(

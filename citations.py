@@ -61,9 +61,10 @@ def build_citations(
                 if float(score) >= limit
             ]
             if not hits:
-                # Fall back to the single best-matching evidence item so the
-                # sentence still resolves to something the user can inspect.
-                hits = [int(np.argmax(similarities))]
+                # Do not attach a weak, nearest-neighbour citation merely to
+                # make an unsupported sentence look grounded.
+                sentence_map[sentence] = []
+                continue
             supported.update(hits)
             sentence_map[sentence] = hits
 
