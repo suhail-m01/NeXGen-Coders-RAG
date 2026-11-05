@@ -1,0 +1,7 @@
+{
+  "id": "Q1-pdf",
+  "expected_sources": [
+    "project_report.pdf"
+  ],
+  "expected_modality": "text"
+}

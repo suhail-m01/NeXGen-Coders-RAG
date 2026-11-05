@@ -1,0 +1,85 @@
+{
+  "dataset_version": "1.0",
+  "description": "Evidence AI fixed evaluation set over the Project Alpha synthetic demo corpus.",
+  "queries": [
+    {
+      "id": "Q1-pdf",
+      "query": "How many records did the ingestion platform process in 2024?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_report.pdf"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "1.2 million"
+      ]
+    },
+    {
+      "id": "Q2-docx",
+      "query": "What is the top open risk carried into 2025?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_notes.docx",
+        "project_report.pdf"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "latency"
+      ]
+    },
+    {
+      "id": "Q3-image",
+      "query": "What does the project dashboard show about team size?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_dashboard.png"
+      ],
+      "expected_modality": "image",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "6"
+      ]
+    },
+    {
+      "id": "Q4-audio",
+      "query": "What did the quarterly review recording say about accuracy?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_meeting.wav"
+      ],
+      "expected_modality": "audio",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "99.4"
+      ]
+    },
+    {
+      "id": "Q5-crossmodal",
+      "query": "What evidence do we have about Project Alpha's 2024 development?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_report.pdf",
+        "project_dashboard.png",
+        "project_meeting.wav",
+        "project_notes.docx"
+      ],
+      "expected_modality": "mixed",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "1.2 million",
+        "99.4"
+      ]
+    },
+    {
+      "id": "Q6-unanswerable",
+      "query": "What was Project Alpha's budget in 2040?",
+      "query_modality": "text",
+      "expected_sources": [],
+      "expected_modality": "none",
+      "expect_abstention": true,
+      "answer_keywords": []
+    }
+  ]
+}

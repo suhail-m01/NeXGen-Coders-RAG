@@ -1,0 +1,7 @@
+{
+  "id": "Q3-image",
+  "expected_sources": [
+    "project_dashboard.png"
+  ],
+  "expected_modality": "image"
+}
