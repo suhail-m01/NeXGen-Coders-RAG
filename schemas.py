@@ -246,6 +246,10 @@ class QueryResponse(BaseModel):
     error_code: ErrorCode | None = None
     query_representation: str | None = None
     latency_ms: dict[str, float] = Field(default_factory=dict)
+    # Ordered pipeline trace: what ran, how long it took, what it moved, and
+    # which check decided the outcome (observability.stage_trace). Empty only for
+    # responses built before tracing was wired.
+    stages: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class IngestionResult(BaseModel):
@@ -253,6 +257,9 @@ class IngestionResult(BaseModel):
 
     source: Source
     items: list[ContentItem] = Field(default_factory=list)
+    # Complete sections the items collapse into at query time (parents.py).
+    # Empty unless chunking_mode is "structure"; never embedded or searched.
+    parents: list[ContentItem] = Field(default_factory=list)
     relationships: list[Relationship] = Field(default_factory=list)
     success: bool = True
     error: str | None = None

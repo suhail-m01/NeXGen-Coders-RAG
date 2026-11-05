@@ -121,6 +121,19 @@ def render_backend_status(pipeline, backend) -> bool:
     return bool(info["ready"])
 
 
+@st.cache_resource(show_spinner=False)
+def cached_manifest() -> dict:
+    """The run manifest, built once per process.
+
+    Building it runs two git subprocesses, which a Streamlit rerun should not
+    repeat on every interaction. Configuration and code version do not change
+    while the app runs; index counts are read live from health instead.
+    """
+    from observability import build_manifest
+
+    return build_manifest()
+
+
 def render_health(pipeline, backend) -> None:
     health = pipeline.health(backend)
     index = health["index"]
@@ -137,8 +150,33 @@ def render_health(pipeline, backend) -> None:
         col_b.metric("Items", index["items"])
         col_a.metric("Vectors", index["vectors"])
         col_b.metric("Links", index["relationships"])
+        if index.get("parents"):
+            col_a.metric("Sections", index["parents"])
+            st.caption(
+                "Complete sections retrieved chunks expand into "
+                "(structure chunking)."
+            )
         if index["by_modality"]:
             st.caption(" · ".join(f"{k}: {v}" for k, v in index["by_modality"].items()))
+
+        st.subheader("Build")
+        manifest = cached_manifest()
+        application = manifest["application"]
+        st.caption(
+            f"commit `{application['git_commit']}`"
+            + (" (uncommitted changes)" if application["git_dirty"] else "")
+            + f" · chunking `{manifest['chunking']['mode']}`"
+        )
+        guards_on = [
+            name.replace("_enabled", "").replace("_", " ")
+            for name, value in manifest["guards"].items()
+            if name.endswith("_enabled") and value
+        ]
+        st.caption("guards on: " + ", ".join(guards_on))
+        with st.expander("Full run manifest"):
+            from observability import manifest_text
+
+            st.code(manifest_text(manifest), language="text")
 
         st.subheader("Models")
         for label, value in health["models"].items():
@@ -269,7 +307,18 @@ def render_response(pipeline, response) -> None:
     render_relationships(response)
     render_evidence(pipeline, response)
 
-    if response.latency_ms:
+    if response.stages:
+        from observability import format_stage_trace
+
+        with st.expander("Pipeline trace"):
+            st.code(format_stage_trace(response.stages), language="text")
+            st.caption(
+                "Every stage this query passed through, in order, with what it "
+                "moved. `off` = disabled in configuration, `-` = not reached "
+                "because an earlier gate answered or refused. The last line is "
+                "the check that decided the outcome."
+            )
+    elif response.latency_ms:
         with st.expander("Timing"):
             for stage, value in response.latency_ms.items():
                 st.caption(f"{stage}: {value:.0f} ms")
@@ -578,8 +627,17 @@ def render_history_message(message: dict) -> None:
         with st.expander("Query representation used for retrieval"):
             st.code(trace["representation"][:2000])
 
+    # A replayed answer shows the trace recorded when it was produced, so an
+    # audit reads the same stages the operator saw -- including the check that
+    # decided it. Older messages stored timings only.
+    stages = trace.get("stages") or []
     timings = message["timings"] or {}
-    if timings:
+    if stages:
+        from observability import format_stage_trace
+
+        with st.expander("Pipeline trace (as recorded)"):
+            st.code(format_stage_trace(stages), language="text")
+    elif timings:
         with st.expander("Stage timings"):
             for stage, value in timings.items():
                 st.caption(f"{stage}: {value:.0f} ms")

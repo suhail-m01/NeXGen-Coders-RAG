@@ -1,0 +1,5 @@
+# Build input only. dist/ IS committed: the FastAPI process serves the built
+# bundle, so a checkout (or the Windows kit) works without npm installed.
+node_modules/
+npm-debug.log*
+.vite/

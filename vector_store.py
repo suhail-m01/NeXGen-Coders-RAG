@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS items (
     FOREIGN KEY (source_id) REFERENCES sources(source_id)
 );
 
+-- Complete sections that retrieved chunks are collapsed into at query time
+-- (parents.py). No vector_id column on purpose: a parent is never embedded and
+-- never returned by search(), it is looked up by id after a child is selected.
+CREATE TABLE IF NOT EXISTS parents (
+    parent_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    modality  TEXT NOT NULL,
+    content   TEXT NOT NULL,
+    location  TEXT NOT NULL,
+    metadata  TEXT NOT NULL,
+    FOREIGN KEY (source_id) REFERENCES sources(source_id)
+);
+
 CREATE TABLE IF NOT EXISTS relationships (
     relationship_id   TEXT PRIMARY KEY,
     source_item_id    TEXT NOT NULL,
@@ -67,6 +80,7 @@ CREATE TABLE IF NOT EXISTS relationships (
 
 CREATE INDEX IF NOT EXISTS idx_items_source    ON items(source_id);
 CREATE INDEX IF NOT EXISTS idx_items_vector    ON items(vector_id);
+CREATE INDEX IF NOT EXISTS idx_parents_source   ON parents(source_id);
 CREATE INDEX IF NOT EXISTS idx_rel_source_item ON relationships(source_item_id);
 CREATE INDEX IF NOT EXISTS idx_rel_target_item ON relationships(target_item_id);
 """
@@ -219,6 +233,7 @@ class VectorStore:
                 self._conn.execute(
                     f"DELETE FROM items WHERE item_id IN ({placeholders})", item_ids
                 )
+            self._conn.execute("DELETE FROM parents WHERE source_id = ?", (source_id,))
             self._conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))
 
             for new_id, (item_id, _) in enumerate(survivors):
@@ -289,6 +304,60 @@ class VectorStore:
             self._conn.commit()
             self.save()
             return stored
+
+    def add_parents(self, parents: list[ContentItem]) -> int:
+        """Persist the complete sections that children collapse into.
+
+        Idempotent by parent_id, so re-ingesting an identical file rewrites the
+        same rows. Parents are deliberately absent from the vector index: a
+        section that duplicates its own children would compete with them in
+        search and push the precise chunk out of the top-k.
+        """
+        if not parents:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO parents VALUES (?,?,?,?,?,?)",
+                [
+                    (
+                        parent.item_id, parent.source_id, parent.modality.value,
+                        parent.content, parent.location.model_dump_json(),
+                        json.dumps(parent.metadata),
+                    )
+                    for parent in parents
+                ],
+            )
+            self._conn.commit()
+        return len(parents)
+
+    def _row_to_parent(self, row: sqlite3.Row) -> ContentItem:
+        return ContentItem(
+            item_id=row["parent_id"],
+            source_id=row["source_id"],
+            modality=Modality(row["modality"]),
+            content=row["content"],
+            location=SourceLocation.model_validate_json(row["location"]),
+            parent_id=None,
+            vector_id=None,
+            metadata=json.loads(row["metadata"]),
+        )
+
+    def get_parent(self, parent_id: str) -> ContentItem | None:
+        """One complete section by id, or None when the index predates it."""
+        row = self._conn.execute(
+            "SELECT * FROM parents WHERE parent_id = ?", (parent_id,)
+        ).fetchone()
+        return self._row_to_parent(row) if row else None
+
+    def get_parents_by_source(self, source_id: str) -> list[ContentItem]:
+        rows = self._conn.execute(
+            "SELECT * FROM parents WHERE source_id = ?", (source_id,)
+        ).fetchall()
+        return [self._row_to_parent(r) for r in rows]
+
+    def parent_count(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) c FROM parents").fetchone()
+        return int(row["c"]) if row else 0
 
     def add_relationships(self, relationships: list[Relationship]) -> None:
         if not relationships:
@@ -472,6 +541,7 @@ class VectorStore:
         rel_count = self._conn.execute(
             "SELECT COUNT(*) c FROM relationships"
         ).fetchone()["c"]
+        parent_count = self.parent_count()
         by_modality = {
             row["modality"]: row["c"]
             for row in self._conn.execute(
@@ -482,6 +552,7 @@ class VectorStore:
             "sources": source_count,
             "items": item_count,
             "relationships": rel_count,
+            "parents": parent_count,
             "vectors": int(self._index.ntotal),
             "by_modality": by_modality,
             "index_path": str(self.index_path),

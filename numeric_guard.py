@@ -96,6 +96,21 @@ def _candidates(token: str, scale: str) -> set[str]:
     return values
 
 
+# Line-initial list ordinals: "3.", "12)", "**4.**", "- 7. ". Structure, not
+# claims -- measured, a looping answer's ordinals 10-17 were reported as figures
+# missing from the evidence, which reads as a warning about numbering.
+_ENUM_RE = re.compile(r"(?m)^([ \t>*#\-]*)\**\d{1,3}\**[.)][ \t]+")
+
+
+def strip_enumeration(text: str) -> str:
+    """Drop enumeration markers so their ordinals are not read as figures.
+
+    Only 1-3 digits followed by '.' or ')' and whitespace at the start of a line
+    are removed, so "2024 was a record year" and "87.5 percent" survive intact.
+    """
+    return _ENUM_RE.sub(r"\1", text or "")
+
+
 def figures_in(text: str) -> list[str]:
     """Figures in `text`, in order of appearance, duplicates kept."""
     return _FIGURE_RE.findall(text or "")
@@ -121,7 +136,7 @@ def unsupported_numbers(
 
     seen: set[str] = set()
     unsupported: list[str] = []
-    for match in _SCALE_RE.finditer(answer or ""):
+    for match in _SCALE_RE.finditer(strip_enumeration(answer) or ""):
         token = match.group(1)
         digits = _digits_only(token)
         if len(digits) < settings.numeric_guard_min_digits:
@@ -197,7 +212,13 @@ def apply_guard(
     if not settings.numeric_guard_enabled or not (answer or "").strip():
         return answer, []
 
-    numbers = unsupported_numbers(answer, evidence_texts, question)
+    # The synthesis aid's completion line names files, pages and sections. Those
+    # locators are metadata, not claims -- "MCA_MP_58-mini-project.pdf" would
+    # otherwise be reported as an unconfirmed figure -- so the guard reads the
+    # answer without it and appends its caveat after it.
+    from synthesis import strip_completion
+
+    numbers = unsupported_numbers(strip_completion(answer), evidence_texts, question)
     if not numbers:
         return answer, []
 

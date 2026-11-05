@@ -45,7 +45,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
-from numeric_guard import last_guard_detail, strip_caveat
+from numeric_guard import last_guard_detail, strip_caveat, strip_enumeration
+from observability import build_manifest
+from synthesis import strip_completion
 from schemas import QueryModality, QueryRequest
 
 DATASET_VERSION = "2.0"
@@ -114,11 +116,14 @@ def hallucinated_numbers(answer: str, evidence_text: str) -> list[str]:
     """Numbers in the answer that appear nowhere in the supplied evidence.
 
     A blunt but honest check: it catches the common 99.4 -> 99.44 style
-    corruption without pretending to be a semantic entailment model.
+    corruption without pretending to be a semantic entailment model. List
+    ordinals are excluded first: a numbered answer's "10." and "11." are
+    structure, and counting them as invented figures once scored a correct answer
+    as hallucinating seven numbers.
     """
     import re
 
-    answer_numbers = set(re.findall(r"\d+\.\d+|\d{2,}", answer))
+    answer_numbers = set(re.findall(r"\d+\.\d+|\d{2,}", strip_enumeration(answer)))
     evidence_numbers = set(re.findall(r"\d+\.\d+|\d{2,}", evidence_text))
     return sorted(answer_numbers - evidence_numbers)
 
@@ -463,13 +468,16 @@ def _write_expectations(dataset: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def git_commit() -> str:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, cwd=Path(__file__).parent, timeout=10,
-        ).stdout.strip() or "unversioned"
-    except Exception:
-        return "unversioned"
+    """Short commit hash, or 'unversioned' when the tree has no git history.
+
+    Delegates to observability.git_commit so the harness and the API report the
+    same commit for the same tree; only the fallback wording differs, and reports
+    already committed to it.
+    """
+    from observability import git_commit as _commit
+
+    value = _commit()
+    return value if value != "unknown" else "unversioned"
 
 
 def run_evaluation(judge: bool = False) -> dict:
@@ -519,9 +527,16 @@ def run_evaluation(judge: bool = False) -> dict:
         # before scoring what the system actually asserted. What it flagged is
         # reported separately rather than hidden.
         flagged, _ = last_guard_detail()
+        # The completion line is stripped here for the same reason the caveat is:
+        # its parentheticals are source locators, not asserted figures. Scoring
+        # them would measure the label format instead of honesty -- a clock range
+        # in a locator once scored a correct answer as hallucinating "00" and
+        # "21". answer_correctness above still sees the full answer.
         invented = (
             [] if response.abstained
-            else hallucinated_numbers(strip_caveat(response.answer), evidence_text)
+            else hallucinated_numbers(
+                strip_completion(strip_caveat(response.answer)), evidence_text
+            )
         )
         abstention_ok = response.abstained == spec["expect_abstention"]
 
@@ -719,6 +734,9 @@ def run_evaluation(judge: bool = False) -> dict:
         "dataset_version": dataset["dataset_version"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "git_commit": git_commit(),
+        # Self-describing runs: the exact build, configuration and index behind
+        # every number in this report, identical to what GET /manifest serves.
+        "manifest": build_manifest(index_stats=pipeline.store.stats()),
         "models": {
             "llm": settings.ollama_model,
             "embedding": settings.embedding_model,

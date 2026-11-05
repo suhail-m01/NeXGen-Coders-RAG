@@ -26,12 +26,14 @@ application needs no internet at all.
 - [Citations](#citations)
 - [Relationships](#relationships)
 - [Abstention](#abstention)
+- [Evidence guards](#evidence-guards)
 - [API](#api)
 - [Configuration](#configuration)
 - [Evaluation](#evaluation)
+- [Observability](#observability)
 - [Offline operation](#offline-operation)
 - [Persistence](#persistence)
-- [Tests](#tests)
+- [Verification](#verification)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 
@@ -46,13 +48,24 @@ application needs no internet at all.
 | Local image understanding | Qwen2.5-VL:3B through Ollama — real image input |
 | Local speech-to-text | faster-whisper, timestamped segments |
 | Semantic retrieval | all-MiniLM-L6-v2 + FAISS (exact cosine) |
-| Reranking | cross-encoder/ms-marco-MiniLM-L-6-v2 |
+| Hybrid retrieval | dense + BM25 candidates fused by reciprocal rank fusion |
+| Reranking | cross-encoder/ms-marco-MiniLM-L-6-v2, length-normalised |
+| Diversity | MMR re-selection with a per-source cap, so one file cannot fill the context |
 | Relationship-aware retrieval | deterministic links + query-time semantic links |
 | Grounded generation | Qwen2.5-VL:3B, evidence-only prompt |
 | Citation transparency | built in code, never emitted by the model |
-| Abstention | refuses before the LLM is ever called |
-| Reproducible evaluation | fixed dataset, versioned reports |
+| Abstention | refuses before the LLM is ever called, per modality |
+| Evidence guards | coverage, entity, temporal, period, numeric and repetition checks — each can refuse, annotate or reorder |
+| Answer completion | a figure stated elsewhere in the retrieved evidence is appended and labelled, never invented |
+| Speaker diarization | spectral clustering over the transcript, so audio evidence can carry more than one voice |
+| Chat history | per-session records with the full pipeline trace, replayable and exportable |
+| Collections | logical groupings; a query can be scoped to one |
+| Accounts and roles | local users, three roles with distinct permissions, lockout, API bearer tokens |
+| Reproducible evaluation | fixed 16-query dataset, versioned reports, regression gate against a baseline |
+| Observability | per-query stage trace and a run manifest naming the exact build |
+| React UI | built to static files and served by the API at `/ui` |
 | Offline runtime | verified with an outbound-socket guard |
+| Offline self-test | 86 checks over the guards, store and trace — no LLM, no network |
 
 ---
 
@@ -104,11 +117,14 @@ application needs no internet at all.
                                |
                     +----------+----------+
                     |                     |
-               Streamlit UI          FastAPI
+             Streamlit UI            FastAPI ---- React UI (/ui)
 ```
 
-**One core, two front ends.** `app.py` and `api.py` both call `rag_pipeline.py`
-and nothing else, so the UI and the API cannot drift apart.
+**One core, three surfaces.** `app.py` and `api.py` both call `rag_pipeline.py`
+and nothing else, so the UIs and the API cannot drift apart. The React app in
+`webui/` is built to static files that `api.py` itself serves at `/ui`, so it
+calls relative URLs: one port, one origin, nothing to configure, and it works
+offline like everything else here.
 
 ---
 
@@ -143,13 +159,15 @@ AUDIO                   ->  timestamped transcript window  ->  MiniLM  ->  FAISS
 | Speech-to-text | `faster-whisper` base, int8 | CPU |
 | OCR | Tesseract 5.5 | CPU |
 | Vector index | FAISS `IndexFlatIP` | CPU |
+| Lexical index | BM25 over the same items, fused with dense by RRF | CPU |
 | Metadata | SQLite | — |
 | PDF | PyMuPDF | — |
 | DOCX | python-docx | — |
 | DOC | LibreOffice headless → DOCX | — |
 | CSV | pandas | — |
 | API | FastAPI + Uvicorn | — |
-| UI | Streamlit | — |
+| UI | React 18 + Vite, served as static files at `/ui` | browser |
+| UI (operator) | Streamlit — accounts, history, ingestion, trace | browser |
 
 **Why PyTorch is pinned to CPU:** on a 4 GB GPU, Ollama already uses ~2.8 GB for
 Qwen. Loading MiniLM, the cross-encoder and Whisper onto CUDA would evict Qwen
@@ -267,6 +285,11 @@ Manually:
 .venv\Scripts\python.exe -m streamlit run app.py
 ```
 
+The React UI needs no separate command: with the API running, open
+<http://127.0.0.1:8000/ui/>. `/` redirects there. The built bundle is committed
+under `webui/dist`, so Node is not required to run it — only to change it
+(`cd webui && npm install && npm run build`).
+
 ---
 
 ## Ingestion
@@ -283,7 +306,11 @@ Ingest everything under `data/`:
 .venv\Scripts\python.exe scripts\ingest_demo.py
 ```
 
-Or use the **Ingest** tab in the UI, or `POST /ingest`.
+Or use the **Sources** panel in the React UI, the **Ingest** tab in Streamlit, or
+`POST /ingest`. Re-ingesting a file that changed replaces the old version when
+`replace=true` is passed; without it both versions stay searchable, and
+`GET /sources/stale` (and the React Sources panel) says which files are in that
+state. `scripts\reindex.py` rebuilds the whole index from `data/` in one pass.
 
 | Format | Extracted as | Location preserved |
 | --- | --- | --- |
@@ -296,7 +323,16 @@ Or use the **Ingest** tab in the UI, or `POST /ingest`.
 | Audio | windowed timestamped transcript | `timestamp_start/end` |
 
 Chunking defaults to 800 characters with 100 overlap, breaking at sentence
-boundaries where possible.
+boundaries where possible (`CHUNKING_MODE=fixed`).
+
+`CHUNKING_MODE=structure` instead cuts on document structure — headings, slides,
+table rows, transcript segments — and stores each block's enclosing section as a
+**parent**, so retrieval matches a small passage and generation reads the wider
+section around it (small-to-big). It is implemented and measured, but it is
+**opt-in**: on this corpus and this model it scored 13/16 against 16/16 for
+`fixed`, because richer context gave a 0.5B model more room to confabulate. The
+gate report for both runs is in `evaluation/reports/`. Switching modes needs a
+reindex — `scripts\reindex.py`.
 
 **`source_id` is a content hash.** Re-ingesting the same bytes produces the same
 IDs and adds no duplicate vectors, which is what makes evaluation reproducible.
@@ -408,26 +444,90 @@ with `abstained = true` and `error_code = INSUFFICIENT_EVIDENCE`. The retrieved
 evidence is still returned so you can see *why* it abstained. A second check
 catches the model emitting `INSUFFICIENT_EVIDENCE` itself.
 
+The threshold is **per modality**. OCR-derived image evidence scores about six
+cross-encoder logits below prose on the same corpus, so when the top-ranked item
+is an image the gate uses `ABSTENTION_THRESHOLD_IMAGE` (-9.0) and otherwise
+`ABSTENTION_THRESHOLD` (-6.0). One global bar would either refuse valid image
+evidence or accept text-scale noise. `scripts\calibrate_abstention.py` measures
+the split on your own corpus instead of guessing it.
+
+---
+
+## Evidence guards
+
+Abstention decides *whether* there is evidence. The guards decide whether the
+evidence answers **this** question, and whether the answer stayed inside it. All
+are deterministic — string, number and date comparisons, never a model judging
+itself — and each is one config flag away.
+
+| Guard | Runs | What it does | Flag |
+| --- | --- | --- | --- |
+| Coverage | before generation | refuses when a number, year or unit in the question appears nowhere in the evidence ("budget in 2040") | `COVERAGE_GUARD_ENABLED` |
+| Entity | before generation | refuses when the question asks about an entity the evidence never mentions, and the evidence mentions a similar one (Project **Beta** vs Project **Alpha**) | `ENTITY_GUARD_ENABLED` |
+| Temporal | after generation | judges each retrieved passage: a figure stated for 2023 does not support an answer about 2024 | `TEMPORAL_GUARD_ENABLED` |
+| Period targeting | before generation | reorders evidence so items mentioning the question's period come first. Reorders only — it never rescores, because rescoring would silently re-calibrate abstention | `PERIOD_TARGETING_ENABLED` |
+| Numeric | after generation | compares every number in the answer against the evidence; an unsupported one appends a caveat and is listed in the trace | `NUMERIC_GUARD_ENABLED` |
+| Repetition | after generation | collapses a small model's looping output; markdown ordinals and locator digits are excluded so a list is not mistaken for a loop | `REPETITION_GUARD_ENABLED` |
+| Evidence completion | after generation | when the answer mentions a metric whose value sits in the evidence but not in the answer, appends it **labelled as quoted from the evidence** | `SYNTHESIS_COMPLETION_ENABLED` |
+
+A guard that fires is visible: the caveat or correction is rendered as its own
+block in both UIs, the stage trace names the decisive check, and the evaluation
+scores `numeric_guard_rate` and `forbidden_leak_rate` so a guard that stops
+working shows up as a regression rather than as a quieter answer.
+
 ---
 
 ## API
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /health` | runtime + index status |
-| `POST /ingest` | upload and index files |
-| `POST /query` | text query |
-| `POST /query_file` | image / audio / document query |
-| `GET /sources` | list indexed sources |
-| `GET /source/{id}` | source detail and its items |
-| `GET /source/{id}/file` | original file (constrained to `data/`) |
+| Endpoint | Purpose | Needs |
+| --- | --- | --- |
+| `GET /` | redirects to the React UI | — |
+| `GET /ui/` | the React front end (static build) | — |
+| `GET /bootstrap` | does this service still have no administrator? | — |
+| `POST /bootstrap` | create the first administrator; closes once one exists | — |
+| `POST /login` | username + password → bearer token | — |
+| `GET /me` | the token's account, role and permissions | `ask` |
+| `POST /logout` | revokes the presented token | — |
+| `GET /health` | backend readiness, dependencies, index, host headroom, build | — |
+| `GET /manifest` | the exact build behind a result | `ask` |
+| `POST /ingest` | upload and index files (`replace=true` retires older versions) | `ingest` |
+| `POST /query` | text query; response carries the stage trace | `ask` |
+| `POST /query_file` | image / audio / document query | `ask` |
+| `GET /sources` | list indexed sources and collections | `ask` |
+| `GET /sources/stale` | filenames with more than one indexed version | `ask` |
+| `GET /source/{id}` | source detail and its items | `ask` |
+| `GET /source/{id}/file` | original file (constrained to `data/`) | `ask` |
+| `DELETE /source/{id}` | remove a source and rebuild the vector index | `delete` |
 
 Interactive docs at `http://127.0.0.1:8000/docs`.
 
+**First run.** A fresh install has no accounts, so nobody can sign in and nobody
+can be granted the permission that creates one. `GET /bootstrap` reports that
+state and `POST /bootstrap` creates the first **administrator** — the only
+unauthenticated endpoint that can create an account, and it answers `409` from
+then on. Both UIs offer the form; after that, accounts come from someone holding
+`manage_users` or from `scripts\create_user.py`.
+
+**Authentication.** Every endpoint except `/health`, `/bootstrap`, `/login` and
+`/logout` needs
+`Authorization: Bearer eai_...`. Tokens belong to a local account with one of
+three roles — `viewer` (ask), `analyst` (ask, ingest), `admin` (also delete,
+manage collections, export history, manage users) — and are minted by
+`scripts\create_user.py <name> --create-token`, or by `POST /login` for a
+browser. Only the token's digest is stored; five failed password attempts lock an
+account for five minutes, and a locked account is told so (HTTP 423) rather than
+being invited to try again. Set `API_AUTH_ENABLED=false` for a single-user
+machine and every endpoint answers anonymously.
+
 ```powershell
-curl -X POST http://127.0.0.1:8000/query `
+# Use curl.exe, not curl: in PowerShell `curl` is an alias for
+# Invoke-WebRequest, which does not accept these flags. Single quotes keep the
+# JSON intact, so no escaped quotes are needed.
+$body = '{"query":"What was budget utilisation in 2024?","query_modality":"text"}'
+curl.exe -X POST http://127.0.0.1:8000/query `
   -H "Content-Type: application/json" `
-  -d '{\"query\":\"What was budget utilisation in 2024?\"}'
+  -H "Authorization: Bearer eai_..." `
+  -d $body
 ```
 
 ---
@@ -448,6 +548,25 @@ Copy `.env.example` to `.env`. Key values:
 | `RELATED_TO_THRESHOLD` | `0.70` | |
 | `CITATION_THRESHOLD` | `0.35` | sentence→evidence attribution |
 | `ABSTENTION_THRESHOLD` | `-6.0` | cross-encoder logit floor |
+| `ABSTENTION_THRESHOLD_IMAGE` | `-9.0` | OCR evidence scores ~6 logits lower |
+| `OLLAMA_NUM_PREDICT` | `512` | output cap: without it a small model can loop until the request times out |
+| `HYBRID_ENABLED` | `true` | BM25 + dense, fused by RRF |
+| `MMR_ENABLED` / `MMR_MAX_PER_SOURCE` | `true` / `2` | diversity, and how much of the context one file may take |
+| `CHUNKING_MODE` | `fixed` | `structure` cuts on headings/rows/segments and stores parent sections |
+| `PARENT_EXPANSION_ENABLED` / `PARENT_MAX_CHARS` | `true` / `1800` | small-to-big: match a passage, generate from its section |
+| `STRUCTURE_MIN_CHUNK_CHARS` | `200` | floor below which structure fragments are merged |
+| `COVERAGE_GUARD_ENABLED` | `true` | refuse when the question's numbers are absent from the evidence |
+| `ENTITY_GUARD_ENABLED` | `true` | refuse when the asked-about entity is absent |
+| `TEMPORAL_GUARD_ENABLED` | `true` | a 2023 figure does not support a 2024 answer |
+| `PERIOD_TARGETING_ENABLED` | `true` | show period-matching evidence first (reorders, never rescores) |
+| `NUMERIC_GUARD_ENABLED` | `true` | caveat an answer number the evidence does not contain |
+| `REPETITION_GUARD_ENABLED` | `true` | collapse looping generation |
+| `SYNTHESIS_COMPLETION_ENABLED` | `true` | append a labelled figure the evidence states but the answer omitted |
+| `DIARIZATION_ENABLED` / `DIARIZATION_MAX_SPEAKERS` | `true` / `6` | speaker clustering over transcripts |
+| `STREAMING_ENABLED` | `true` | token streaming (`query_stream`) |
+| `API_AUTH_ENABLED` | `true` | bearer tokens and roles |
+
+`.env.example` documents every one of these with the reason it exists.
 | `MAX_CONTEXT_ITEMS` | `5` | |
 | `MAX_INSPECT_IMAGES` | `1` | context budget |
 | `TORCH_DEVICE` | `cpu` | GPU reserved for Ollama |
@@ -460,27 +579,48 @@ Copy `.env.example` to `.env`. Key values:
 .venv\Scripts\python.exe evaluation.py
 ```
 
-Fixed dataset at `evaluation/dataset/queries.json` (version 1.0) with six
-queries: PDF, DOCX, image, audio, cross-modal, and one deliberately
-unanswerable.
+Fixed dataset at `evaluation/dataset/queries.json` (**version 2.0**, 16 queries):
+per-modality, multi-hop, an unanswerable question, a temporal trap, a
+forbidden-leak trap and a paper-limitation question. Each query carries expected
+sources, expected answers, `must_not_contain` strings and tags.
 
-Reports land in `evaluation/reports/` as JSON + CSV + Markdown, each stamped
-with dataset version, all four model names, the full configuration, the git
-commit and a timestamp.
+```powershell
+.venv\Scripts\python.exe evaluation.py                # run and report
+.venv\Scripts\python.exe evaluation.py --compare      # gate against baseline.json
+```
 
-**Measured results** (dataset v1.0, demo corpus):
+`--compare` is the regression gate: it diffs every gated metric against
+`evaluation/baseline.json`, per modality and per query, and exits 1 on any
+regression (2 when it cannot gate at all, for example a dataset-version mismatch,
+which it refuses to compare silently). Nothing may land unless it exits 0.
 
-| Metric | Value |
-| --- | --- |
-| Retrieval precision | 0.40 |
-| Retrieval recall | 0.96 |
-| MRR | 0.75 |
-| Citation accuracy | 0.59 |
-| Answer correctness | 1.00 |
-| Groundedness | 1.00 |
-| Hallucination rate | 0.00 |
-| Abstention accuracy | 1.00 |
-| Mean latency | 20.8 s |
+Reports land in `evaluation/reports/` as JSON + CSV + Markdown, each stamped with
+the dataset version, all four model names, the full configuration, the git commit,
+a timestamp and the **run manifest** — so any score can be traced back to the
+build that produced it.
+
+**Measured results** — dataset v2.0, demo corpus, `qwen2.5:0.5b`, gate run
+`report_20261105_200057` (**16 PASS / 0 CHECK**, `--compare` exit 0):
+
+| Metric | Baseline | Now |
+| --- | --- | --- |
+| Retrieval precision | 0.3115 | 0.3115 |
+| Retrieval recall | 0.9635 | 0.9635 |
+| MRR | 0.6146 | **0.6458** |
+| Citation accuracy | 0.4135 | **0.5510** |
+| Answer correctness | 0.8125 | **1.0000** |
+| Groundedness | 0.9375 | 0.9375 |
+| Hallucination rate | 0.0625 | 0.0625 |
+| Abstention accuracy | 0.8750 | **1.0000** |
+| Numeric-guard rate | — | 0.0000 |
+| Forbidden-leak rate | 0.1875 | **0.0000** |
+| Mean latency | 6.58 s | 11.01 s |
+
+Latency roughly doubled because the guards and the completion pass added work and
+the output cap lengthened some generations; every gated quality metric moved up or
+held. One per-query change is reported rather than gated: Q16's citation accuracy
+went 1.0 → 0.8, because the answer now quotes two sources where the dataset
+expects one.
 
 > **Reading precision honestly.** Precision looks low because the metric counts
 > any retrieved file not in `expected_sources` as a miss — but the demo corpus is
@@ -491,10 +631,50 @@ commit and a timestamp.
 
 **Determinism.** Retrieval, reranking, relationships and citations are exactly
 reproducible. Generation is not: Qwen is sampled and Ollama gives no
-cross-version seed guarantee. Temperature is pinned to 0.0, so answer-level
-metrics are *approximately* reproducible. Groundedness is scored by keyword and
+cross-version seed guarantee, even with `OLLAMA_SEED=42` and temperature 0.0 —
+measured here as three identical calls producing answers of 385, 3114 and 3114
+characters. Answer-level metrics are therefore *approximately* reproducible, and a
+suspect query is re-run two or three times before a conclusion is drawn from it. Groundedness is scored by keyword and
 number overlap, never by an LLM judge — a 3B model grading its own output would
 be neither reliable nor honest.
+
+---
+
+## Observability
+
+Two artefacts answer the questions an evidence system actually gets asked.
+
+**The stage trace** — every `POST /query` response carries `stages`, and both UIs
+render it. Fifteen ordered stages, each with its milliseconds, what it moved (10
+candidates → 5 selected → 2 context blocks → 3 citations), whether it ran, and
+*why not* if it didn't: "not reached" for a stage the pipeline stopped before,
+"disabled by `entity_guard_enabled`" for one switched off. A guard that never
+fired and a guard that is turned off must be distinguishable, or the trace is
+decorative. The last rows are the end-to-end time with the outcome
+(`answered` / `abstained (INSUFFICIENT_EVIDENCE)`) and the **decisive check** —
+the one sentence that explains the result:
+
+```
+entity guard: question asks about Project Beta; evidence only mentions Alpha
+```
+
+Refusals carry the same trace as answers, including their total time, so
+"refused in 636 ms without calling the model" is a fact you can show rather than
+assert. Traces are stored with each chat-history message and replayed from
+history.
+
+**The run manifest** — `GET /manifest`, `scripts\manifest.py`, the Streamlit
+sidebar and every evaluation report all carry the same document: git commit and
+whether the tree is dirty, platform, the four model names, every retrieval,
+chunking, guard, generation and auth setting, index counts and dataset version.
+A screenshot of an answer is only reproducible if the build behind it is recorded
+too.
+
+`GET /health` adds host headroom to what it already reported — CPU, RAM, free
+disk, uptime, auth mode, chunking mode, guard flags — and degrades from `ok` to
+`degraded` with a note when free disk or available RAM is too low for ingestion
+or model loading. "The service answered 200" is not the same as "the service can
+still write to its index".
 
 ---
 
@@ -510,13 +690,19 @@ index, runs a full cross-modal query and an abstention check. If anything
 silently reaches for the network it raises instead of quietly succeeding while
 you still have Wi-Fi.
 
-Verified result on this machine:
+Verified result on this machine (`qwen2.5:0.5b`, 6-source demo index):
 
 ```
-8/8 checks passed
-No outbound network connections were attempted.
-The only sockets used were loopback to Ollama.
-OFFLINE RUNTIME: VERIFIED
+=== Embeddings, offline ===
+  [OK]   384-d vector in 11.9s, no network used
+=== Reranking, offline ===
+  [OK]   cross-encoder logit 2.295 in 0.4s
+=== Full question answering, offline ===
+  [OK]   answered using only local models and the local Ollama server
+=== Outbound access attempted during this run ===
+  [OK]   none - every socket stayed on loopback
+
+Offline verification PASSED. The runtime works with no internet.
 ```
 
 **Loopback is not the internet.** Ollama runs at `127.0.0.1:11434` and Streamlit
@@ -543,24 +729,23 @@ The index reloads from disk. `test_index_survives_restart` and
 
 ---
 
-## Tests
+## Verification
 
-```powershell
-.venv\Scripts\python.exe -m pytest tests\ -v          # everything
-.venv\Scripts\python.exe -m pytest tests\ -m "not live_ollama"   # no LLM needed
-```
+There is no pytest suite in this repository, and nothing here claims otherwise.
+Verification is five commands, run in this order, each with a real exit code:
 
-**51 tests, all passing.** Nothing is mocked except two deliberate failure
-injections (Ollama down, vision failure). Tests skip rather than fail when a
-dependency is genuinely absent, so the suite never reports a pass it didn't earn.
+| Command | Proves | Needs | Last run |
+| --- | --- | --- | --- |
+| `python scripts\selftest.py` | **86/86 checks**: constraint guards (entity, temporal, period targeting, ordinal-quarter pairing, and that reordering does not rescore), evidence completion, repetition collapse, numeric-guard locator exclusions, parent building and expansion, stage trace, manifest, and the `parents` table round-trip including delete cascade | nothing — no LLM, no network, throwaway index | exit 0 |
+| `python scripts\apitest.py` | **30 checks** over the browser-facing API, through a test client so no port is bound: the static bundle and its relative asset paths under `/ui`, `POST /login`, `GET /me`, `POST /logout`, viewer-versus-admin permissions (403 not 401), stale versions, manifest, first-run bootstrap and the lockout ladder. `--with-query` adds the live `/query` contract (**32/32** measured) | nothing for the 30; Ollama for `--with-query` | exit 0 |
+| `python scripts\verify_env.py` | every import resolves and each external binary is reachable, including a real audio decode | installed dependencies | exit 0 |
+| `python scripts\smoke_test.py` | **4/4** end-to-end questions answered with citations, plus a genuine abstention | Ollama + cached models | exit 0 |
+| `python scripts\verify_offline.py` | blocks every non-loopback socket for the whole run, then loads the models and answers — proving the offline claim rather than asserting it | cached models | exit 0 |
+| `python evaluation.py --compare` | **16/16 PASS**, no gated metric below `baseline.json`, per modality and per query | Ollama + built index | exit 0 |
 
-Coverage: schemas and ID determinism, chunking, PDF/DOCX/TXT/CSV extraction and
-page/section preservation, embedding dimension and normalisation, FAISS
-insert/search/reload, idempotent re-ingestion, retrieval ranking and source
-exclusion, rerank ordering and score preservation, relationship thresholds,
-citation construction and rendering, real OCR, real Whisper timestamps, real
-Qwen vision, LLM abstention, no-citation-markers, API endpoints, and four
-end-to-end query modes.
+`selftest.py` is the one to run before a demo: it needs no model, no index and no
+network, so it works on a laptop that has not finished downloading anything yet,
+and it exits non-zero if a guard has stopped behaving.
 
 ---
 
@@ -576,7 +761,13 @@ end-to-end query modes.
 | First query takes ~40 s | model was unloaded | expected; raise `OLLAMA_KEEP_ALIVE` |
 | Very slow generation | model split to CPU | expected on 4 GB VRAM |
 | Empty results | nothing indexed | run `scripts\ingest_demo.py` |
-| Everything abstains | threshold too strict | raise `ABSTENTION_THRESHOLD` |
+| Everything abstains | threshold too strict | raise `ABSTENTION_THRESHOLD` (and `ABSTENTION_THRESHOLD_IMAGE` for image questions) |
+| Refused but evidence looks fine | a guard fired | read the **decisive check** row of the pipeline trace; it names the guard and why |
+| Answer repeats itself | small model looping | `REPETITION_GUARD_ENABLED` collapses it; `OLLAMA_NUM_PREDICT` caps it |
+| First query takes ~35 s | models loading | expected once per process; the UI says so while it waits |
+| `401` from the API | no or revoked token | `scripts\create_user.py <name> --create-token`, or `POST /login` |
+| `423` from `/login` | account locked | wait 5 minutes, or reset the password with `--set-password` |
+| React UI shows nothing | `webui/dist` missing | `cd webui && npm install && npm run build` |
 
 ---
 
@@ -600,11 +791,31 @@ Stated plainly rather than hidden.
 6. **DOCX has no page numbers.** By design — see [Citations](#citations).
 7. **`.doc` needs LibreOffice.** Without it, `.doc` ingestion fails loudly with
    `CONVERSION_UNAVAILABLE` rather than silently producing nothing.
-8. **No speaker diarization.** Whisper does not identify speakers and this
-   project does not invent them.
+8. **Diarization clusters, it does not identify.** `diarization.py` groups
+   transcript segments by spectral clustering over the audio, so a block can say
+   "speaker 2" — it cannot say who that is, and with short or single-voice
+   recordings it will report one speaker. It is gated by `DIARIZATION_ENABLED`
+   and never invents a second voice where the audio has one.
 9. **English only** as configured (Tesseract `eng`, Whisper default).
-10. **Single-user, local scale.** `IndexFlatIP` is exact search, ideal up to
-    ~10⁵ vectors. Beyond that, switch to an approximate index.
+10. **Single-machine, local scale.** `IndexFlatIP` is exact search, ideal up to
+    ~10⁵ vectors; beyond that, switch to an approximate index. Accounts, tokens
+    and history live in local SQLite files, and the service speaks plain HTTP —
+    passwords are salted and hashed and tokens are stored as digests, but putting
+    this on a network means putting TLS in front of it. The lockout slows guessing;
+    it does not stop an attacker who has the database file.
+11. **The guards are deterministic, not semantic.** They compare numbers, years,
+    entities and repeated spans. A paraphrase that drops the year entirely can
+    pass the temporal guard, and the coverage guard checks that a question's
+    figures appear in the evidence, not that the evidence *means* what the answer
+    says. They are a floor under answer quality, not a proof of it.
+12. **Structure mode is opt-in and measured worse here.** `CHUNKING_MODE=structure`
+    with parent expansion scored 13/16 against 16/16 for `fixed` on this corpus
+    with a 0.5B model: more context per block gave the model more room to
+    confabulate (it produced a confident "87%" for a figure the evidence did not
+    contain, and denied a limitation that was in the deck). Both runs are in
+    `evaluation/reports/`. It stays in the codebase because the mechanism is sound
+    and a larger model is the variable that changed — not because it currently
+    wins.
 
 ---
 
@@ -612,37 +823,79 @@ Stated plainly rather than hidden.
 
 ```
 EvidenceAI/
-├── app.py                  Streamlit UI
-├── api.py                  FastAPI service
+├── app.py                  Streamlit operator UI (accounts, history, ingestion, trace)
+├── api.py                  FastAPI service + serves the React UI at /ui
 ├── rag_pipeline.py         the single orchestrator
 ├── config.py               all configuration
 ├── schemas.py              shared data contracts
+├── providers.py            offline (Ollama) / online inference backends
 │
 ├── documents.py            PDF / DOC / DOCX / TXT / CSV
+├── chunking.py             fixed and structure-aware chunking
 ├── images.py               OCR + Qwen vision
+├── ocr.py                  upscaling, confidence, digit filtering
 ├── audio.py                faster-whisper
+├── diarization.py          spectral speaker clustering
 │
 ├── embeddings.py           MiniLM (CPU, cached)
-├── vector_store.py         FAISS + SQLite
-├── retriever.py            semantic search
+├── vector_store.py         FAISS + SQLite (items, sources, links, parents)
+├── lexical.py              BM25 over the same items
+├── retriever.py            hybrid dense + lexical search
 ├── reranker.py             cross-encoder
+├── mmr.py                  diversity re-selection with a per-source cap
 ├── relationships.py        deterministic + semantic links
-├── llm.py                  Ollama / Qwen2.5-VL
+├── parents.py              small-to-big parent sections
+├── llm.py                  Ollama / Qwen prompt building and generation
 ├── citations.py            programmatic citations
-├── evaluation.py           reproducible evaluation
+├── synthesis.py            labelled evidence completion
+│
+├── coverage_guard.py       question numbers must exist in the evidence
+├── constraint_guard.py     entity, temporal and period-targeting checks
+├── numeric_guard.py        answer numbers must exist in the evidence
+├── repetition_guard.py     collapse looping generation
+│
+├── observability.py        stage trace + run manifest
+├── chat_history.py         sessions, messages, stored traces
+├── auth.py                 local accounts, roles, lockout, API tokens
+├── llm_judge.py            optional LLM-graded arm (unreliable on small models)
+├── evaluation.py           16-query harness + regression gate
 ├── create_demo_data.py     synthetic demo corpus
+├── run_demo.py             the seven demo scenarios
+│
+├── webui/                  React front end
+│   ├── src/                App, api client, Login, Ask, Answer, Evidence,
+│   │                       StageTrace, Sources, Health
+│   ├── dist/               committed build — no Node needed to run it
+│   ├── vite.config.js      relative base + dev proxy
+│   └── package.json        react, react-dom, vite
 │
 ├── scripts/
-│   ├── verify_env.py       import verification
+│   ├── verify_env.py       import and binary verification
 │   ├── prepare_models.py   online model caching
 │   ├── ingest_demo.py      bulk ingestion
-│   ├── run_demo.py         the seven demo scenarios
-│   └── verify_offline.py   offline proof with socket guard
+│   ├── reindex.py          rebuild the whole index from data/
+│   ├── smoke_test.py       4 end-to-end questions + an abstention
+│   ├── verify_offline.py   offline proof with a socket guard
+│   ├── selftest.py         86 offline checks, no model or network
+│   ├── calibrate_abstention.py  measure the threshold split on your corpus
+│   ├── create_user.py      accounts, roles, tokens
+│   └── manifest.py         print or write the run manifest
 │
 ├── data/{documents,images,audio}/
 ├── index/                  FAISS + SQLite (generated)
-├── evaluation/{dataset,expected_answers,expected_sources,reports}/
-└── tests/{test_core.py,test_integration.py}
+├── history/                chat sessions (generated)
+├── auth/                   accounts and token digests (generated)
+├── evaluation/
+│   ├── dataset/queries.json     16 queries, version 2.0
+│   ├── expected_answers/        32 mirrored expectations
+│   ├── expected_sources/
+│   ├── baseline.json            the gate baseline — never overwritten silently
+│   └── reports/                 versioned JSON + CSV + Markdown
+│
+├── README.md  DEMO_RUNBOOK.md  WINDOWS_SETUP_GUIDE.md  DEPLOYMENT.md
+├── READ_ME_FIRST.txt  .env.example
+├── requirements.txt  requirements-lock.txt  packages.txt
+└── start.ps1  setup_windows.ps1  setup.ps1
 ```
 
 ---
@@ -652,7 +905,7 @@ EvidenceAI/
 ```powershell
 .venv\Scripts\python.exe create_demo_data.py
 .venv\Scripts\python.exe scripts\ingest_demo.py
-.venv\Scripts\python.exe scripts\run_demo.py
+.venv\Scripts\python.exe run_demo.py
 ```
 
 Seven scenarios: cross-modal text query, image→documents, audio→documents,

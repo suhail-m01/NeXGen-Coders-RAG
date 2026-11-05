@@ -12,12 +12,18 @@ Project: `AnishPreetham/Multi-Modal-RAG` — this kit is that repository **plus 
 |---|---|
 | **`READ_ME_FIRST.txt`** | **Start here** — the commands on one screen |
 | **`WINDOWS_SETUP_GUIDE.md`** | **This document** |
-| `app.py` | Streamlit web UI (port **8501**) |
-| `api.py` | FastAPI service (port **8000**, docs at `/docs`) |
+| **`webui/`** | **React front end**, served by the API at **http://127.0.0.1:8000/ui/** — `dist/` is a committed build, so no Node needed |
+| `app.py` | Streamlit operator UI (port **8501**): accounts, chat history, collections |
+| `api.py` | FastAPI service (port **8000**, docs at `/docs`), also serves the React UI |
 | `rag_pipeline.py` | The pipeline: extract → embed → retrieve → rerank → abstain → generate → cite |
 | `documents.py`, `images.py`, `audio.py` | Per-modality extractors (PDF/DOCX/CSV, OCR, Whisper) |
 | `embeddings.py`, `vector_store.py`, `retriever.py`, `reranker.py` | MiniLM embeddings, FAISS + SQLite store, cross-encoder reranking |
-| `citations.py`, `relationships.py`, `evaluation.py` | Programmatic citations, cross-source links, evaluation harness |
+| `citations.py`, `relationships.py`, `evaluation.py` | Programmatic citations, cross-source links, 16-query evaluation harness + regression gate |
+| `coverage_guard.py`, `constraint_guard.py`, `numeric_guard.py`, `repetition_guard.py`, `synthesis.py` | The evidence guards: refuse, caveat, reorder or complete — never silently |
+| `parents.py`, `chunking.py`, `lexical.py`, `mmr.py` | Small-to-big parent sections, structure-aware chunking, BM25, diversity re-selection |
+| `observability.py` | Per-query stage trace and the run manifest |
+| `auth.py`, `chat_history.py` | Local accounts, roles, lockout, API tokens; sessions with stored traces |
+| **`DEMO_RUNBOOK.md`** | **The 15-minute jury demo, line by line, with measured expectations** |
 | `config.py`, `.env`, `.env.example` | All tunables; `.env` overrides defaults |
 | `data/` | Demo dataset (PDF, DOCX, CSV, PNG, WAV) + your `MCA_MP_58-mini-project.pdf` |
 | `requirements-lock.txt` | **Pinned** dependency versions (use this one) |
@@ -28,6 +34,11 @@ Project: `AnishPreetham/Multi-Modal-RAG` — this kit is that repository **plus 
 | **`scripts/ingest_demo.py`** | **Added by me** — builds the index from `data/` |
 | **`scripts/verify_offline.py`** | **Added by me** — blocks all internet, then answers a question |
 | **`scripts/smoke_test.py`** | **Added by me** — asks test questions, prints answers + citations |
+| **`scripts/selftest.py`** | **Added by me** — 86 offline checks over the guards, store and trace; no model, no network |
+| **`scripts/manifest.py`** | **Added by me** — prints or writes the build manifest behind any result |
+| **`scripts/reindex.py`** | **Added by me** — rebuilds the whole index when settings change |
+| **`scripts/calibrate_abstention.py`** | **Added by me** — measures the threshold split on your own corpus |
+| **`scripts/create_user.py`** | **Added by me** — accounts, roles and API tokens from the command line |
 
 No index is shipped: it is built fresh on your machine during setup, which also proves the pipeline works on your hardware.
 
@@ -172,12 +183,16 @@ Then it generates the demo data and builds the index with `scripts\ingest_demo.p
 ```powershell
 .\start.ps1
 ```
-- UI → **http://localhost:8501**
-- API → http://127.0.0.1:8000/docs
+- **React UI → http://127.0.0.1:8000/ui/** (opened for you automatically)
+- Operator UI (Streamlit) → http://localhost:8501
+- API docs → http://127.0.0.1:8000/docs
 
-Lighter option (UI only, skips the API process):
+`start.ps1` reads `OLLAMA_MODEL` from `.env`, so the `qwen2.5:0.5b` this kit ships
+with is accepted instead of warning that a 3B model is missing. Add `-NoBrowser` to
+keep the window closed, or `-ApiOnly` for just the API and the React UI:
 ```powershell
-.\start.ps1 -UiOnly
+.\start.ps1 -ApiOnly        # React UI only, no Streamlit process
+.\start.ps1 -UiOnly         # Streamlit only, no API
 ```
 
 ### Step 10 — Verify it works
@@ -187,17 +202,36 @@ In a second PowerShell window:
 ```
 This asks four questions (tabular, audio, document, and one that should be refused) and prints each answer with its **citations**, confidence and latency. Check that the cited page/timestamp actually contains the claim.
 
+Run the offline self-test — it needs no model, no index and no network, so it works
+even before `prepare_models.py` has finished:
+```powershell
+.\.venv\Scripts\python scripts\selftest.py
+```
+Expect **86/86 checks passed** and exit code 0.
+
 Then prove the offline guarantee:
 ```powershell
 .\.venv\Scripts\python scripts\verify_offline.py
 ```
 It blocks every non-loopback socket and DNS lookup, then answers a question. `PASSED` means nothing reached the internet. (Local Ollama on 127.0.0.1 is intentionally allowed — “offline” means no internet, not no local processes.)
 
+And the acceptance gate, once the index exists:
+```powershell
+.\.venv\Scripts\python evaluation.py --compare
+```
+Expect **16 PASS / 0 CHECK** and exit code 0. Exit 1 means a gated metric fell below
+`evaluation\baseline.json`; exit 2 means it could not gate at all (for example a
+dataset-version mismatch, which it refuses to compare silently).
+
 ---
 
 ## 5. Using it
 
-**Sign in** — the UI is gated. On first run there are no accounts, so it offers to create the **first administrator** (no default password is shipped, on purpose). Accounts live in `auth\users.db` as PBKDF2-HMAC-SHA256 hashes with a per-user salt; five failed attempts lock an account for five minutes.
+**Sign in** — both UIs are gated. On first run there are no accounts, so each offers to create the **first administrator** (no default password is shipped, on purpose); the React UI asks `GET /bootstrap` and shows that form, and the door closes with a `409` the moment any account exists. Accounts live in `auth\users.db` as PBKDF2-HMAC-SHA256 hashes with a per-user salt; five failed attempts lock an account for five minutes, and a locked account is told so (the React UI shows the unlock time) rather than being invited to try a sixth time. The same accounts sign in to both UIs, and `POST /login` exchanges a password for a bearer token labelled `web-ui` so an administrator can revoke browser sessions without touching CLI tokens.
+
+**Two front ends, one pipeline.** Use the **React UI** (`http://127.0.0.1:8000/ui/`) for asking questions: citation markers in the answer are buttons that scroll to and outline the evidence block they came from, guard output is rendered as its own block rather than folded into the paragraph, the evidence list shows retrieval and rerank scores with OCR confidence per image block, and every answer carries its **pipeline trace** — fifteen stages, what each moved, which ones did not run and why, and the decisive check. Its Sources panel also shows which files have more than one indexed version.
+
+Use the **Streamlit operator UI** (`:8501`) for the back office: creating and managing accounts, browsing and replaying chat history with its stored trace, exporting a session to Markdown or CSV, and managing collections. Both call `rag_pipeline.py` and nothing else, so they cannot drift apart.
 
 Three roles:
 
@@ -316,12 +350,25 @@ Every item below is config-gated, so each can be switched off in `.env` without 
 | Corpus management | `delete_source` with a safe index rebuild (positional FAISS ids make in-place removal unsafe) | — |
 | Evaluation | Optional LLM-judge arm with order-swap consistency checking | `llm_judge.py` |
 | Reproducibility | Fixed Ollama seed, so evaluation reports are comparable run to run | — |
+| Grounding | Entity guard: refuse when the asked-about entity is absent but a similar one is present ("Project Beta" against a corpus of Alpha) — before generation, measured 0.7 s | `constraint_guard.py` |
+| Grounding | Temporal guard, judging each retrieved **passage** rather than the whole block, so a 2023 figure cannot support a 2024 answer from the same section | `constraint_guard.py` |
+| Retrieval | Period targeting: evidence mentioning the question's period is shown first. Reorders only — never rescores, because the best score calibrates abstention | `constraint_guard.py` |
+| Grounding | Ordinal-period pairing by proximity, so "third quarter of 2024" is read as Q3 2024 and not as two unrelated tokens | `constraint_guard.py` |
+| Generation | Hard output cap (`OLLAMA_NUM_PREDICT=512`): an uncapped small model looped past the 300 s client timeout while the server kept generating | — |
+| Generation | Repetition guard: collapses looping output, excluding markdown ordinals and locator digits so a list is not mistaken for a loop | `repetition_guard.py` |
+| Generation | Evidence completion: a figure the evidence states but the answer omitted is appended **labelled as quoted**, never woven in | `synthesis.py` |
+| Chunking | Structure-aware splitting (headings, slides, table rows, transcript segments) with each block's section stored as a **parent** for small-to-big retrieval — implemented, measured, **opt-in** (see §10) | `chunking.py`, `parents.py` |
+| Corpus | Replace-on-change ingestion, `stale_versions`, and a full reindex that preserves collections and leaves history and accounts alone | `scripts\reindex.py` |
+| Evaluation | Dataset v2.0 (16 queries, adversarial and multi-hop), per-modality and per-query gating, and `--compare` as a build gate with real exit codes | `evaluation/baseline.json` |
+| Observability | Per-query stage trace on every path including refusals; run manifest in `/manifest`, `/health`, the sidebar and every report | `observability.py`, `scripts\manifest.py` |
+| Quality assurance | 86 offline checks over guards, parents, trace, manifest and the store — no LLM, no network, exit 0/1 | `scripts\selftest.py` |
+| UX | React front end served by the API at `/ui`: interactive citations, guard blocks, evidence with scores, stage trace, stale-version surface, health and manifest | `webui/` |
 
-Modified upstream files (16, verified with `git status`): `.env.example`, `app.py`, `audio.py`, `config.py`, `documents.py`, `evaluation.py`, `images.py`, `llm.py`, `providers.py`, `rag_pipeline.py`, `requirements-lock.txt`, `requirements.txt`, `reranker.py`, `retriever.py`, `schemas.py`, `vector_store.py`.
+Modified upstream files (**17**, verified with `git diff --name-only --diff-filter=M` against the initial commit): `.env.example`, `api.py`, `app.py`, `audio.py`, `config.py`, `documents.py`, `evaluation.py`, `images.py`, `llm.py`, `providers.py`, `rag_pipeline.py`, `requirements-lock.txt`, `requirements.txt`, `reranker.py`, `retriever.py`, `schemas.py`, `vector_store.py`.
 
-Added by this kit: `lexical.py`, `mmr.py`, `diarization.py`, `ocr.py`, `coverage_guard.py`, `numeric_guard.py`, `chat_history.py`, `auth.py`, `llm_judge.py`, `run_demo.py`, `setup_windows.ps1`, this guide, and everything under `scripts\` (`ingest_demo.py`, `smoke_test.py`, `verify_env.py`, `prepare_models.py`, `verify_offline.py`, `calibrate_abstention.py`, `create_user.py`).
+Added by this kit (**83 files**, same `git diff --diff-filter=A`): the modules `lexical.py`, `mmr.py`, `diarization.py`, `ocr.py`, `chunking.py`, `parents.py`, `coverage_guard.py`, `constraint_guard.py`, `numeric_guard.py`, `repetition_guard.py`, `synthesis.py`, `observability.py`, `chat_history.py`, `auth.py`, `llm_judge.py`; `run_demo.py`, `setup_windows.ps1`, `DEMO_RUNBOOK.md`, `READ_ME_FIRST.txt`, this guide; the whole React front end under `webui\` (source plus the committed `dist\` build); the versioned dataset and baseline under `evaluation\`; and everything under `scripts\` (`ingest_demo.py`, `smoke_test.py`, `selftest.py`, `verify_env.py`, `prepare_models.py`, `verify_offline.py`, `calibrate_abstention.py`, `create_user.py`, `reindex.py`, `manifest.py`).
 
-`api.py` accepts a `QueryRequest` directly, so it picked up collection scoping and the new response behaviour from `schemas.py` with no change to the contract.
+`api.py` accepts a `QueryRequest` directly, so it picked up collection scoping and the new response behaviour from `schemas.py` without a change to that contract. `api.py` itself **is** modified, and this guide said otherwise until now: it carries bearer-token authentication, `DELETE /source/{id}`, the browser session endpoints, the stale-version endpoint, the runtime block in `/health`, `/manifest`, and the static mount that serves the React UI. `QueryResponse` gained one optional field, `stages`, which defaults to empty — so an existing client that ignores it keeps working.
 
 **The API is authenticated.** Every endpoint except `GET /health` requires a bearer token that resolves to one of the same local accounts the UI uses, and is checked against that account's role:
 
@@ -331,7 +378,9 @@ Authorization: Bearer eai_...
 
 | Endpoint | Permission needed |
 | --- | --- |
-| `GET /health` | none (runtime status only) |
+| `GET /health`, `GET /bootstrap`, `POST /bootstrap`, `POST /login`, `POST /logout`, `GET /`, `GET /ui/` | none (status, first-run bootstrap, session, and the static UI) |
+| `GET /me`, `GET /manifest` | `ask` |
+| `GET /sources/stale` | `ask` |
 | `POST /query`, `POST /query_file`, `GET /sources`, `GET /source/{id}`, `GET /source/{id}/file` | `ask` (viewer and above) |
 | `POST /ingest` | `ingest` (analyst and above) |
 | `POST /ingest` with `replace=true` | `ingest` **and** `delete` (admin) |
@@ -341,7 +390,23 @@ Mint, list and revoke tokens with `scripts\create_user.py --create-token | --lis
 
 One rename worth knowing about: the coverage guard module is `coverage_guard.py`, **not** `coverage.py`. A bare `coverage.py` shadows the PyPI `coverage` package that numba imports, and numba is a librosa dependency — the collision broke the audio decode path with a confusing `module 'coverage' has no attribute 'types'`. If you keep any older copy of this kit, do not rename it back.
 
-Measured effect on the six-query evaluation set (CPU, `qwen2.5:0.5b`): 3 PASS / 3 CHECK became **5 PASS / 1 CHECK**; answer correctness 0.667 → 0.833; citation accuracy 0.381 → 0.631; groundedness 0.833 → **1.0**; hallucination rate 0.167 → **0.0**; abstention accuracy 0.667 → **1.0**. The one remaining CHECK (Q5, a broad cross-modal question) is the substitute model copying its top passage verbatim rather than synthesising — retrieval and citation for that query are correct.
+Measured effect on the **then** six-query set (CPU, `qwen2.5:0.5b`): 3 PASS / 3 CHECK became 5 PASS / 1 CHECK; groundedness 0.833 → 1.0; hallucination 0.167 → 0.0; abstention 0.667 → 1.0.
+
+That set was then replaced by dataset v2.0 (16 queries, with adversarial and multi-hop items), so the honest current numbers are these — `report_20261105_200057`, gate exit 0, **16 PASS / 0 CHECK**:
+
+| Metric | Baseline (v2.0, before the guards) | Now |
+|---|---|---|
+| Answer correctness | 0.8125 | **1.0000** |
+| Abstention accuracy | 0.8750 | **1.0000** |
+| Forbidden-leak rate | 0.1875 | **0.0000** |
+| Citation accuracy | 0.4135 | **0.5510** |
+| MRR | 0.6146 | **0.6458** |
+| Groundedness | 0.9375 | 0.9375 |
+| Hallucination rate | 0.0625 | 0.0625 |
+| Retrieval precision / recall | 0.3115 / 0.9635 | 0.3115 / 0.9635 |
+| Mean latency | 6.58 s | 11.01 s |
+
+The four items that were CHECK on v2.0 — multi-figure synthesis, a near-miss year, an entity that does not exist, a table near-miss — now pass, and they pass because deterministic guards run before and after generation rather than because the 0.5b model improved. Latency roughly doubled: the guards, the completion pass and the output cap all cost time, and generation dominates it.
 
 ### The original packaging problems (still true)
 
@@ -391,6 +456,9 @@ Also **not** tested on Windows-specific paths: `pyttsx3`/SAPI demo-audio generat
 - **The LLM judge is unusable at 0.5b, measured.** It answered "A" to nine out of nine order-swapped questions about a correct answer, a wrong-figure answer and a non-answer. The consistency check catches this and reports `UNUSABLE` instead of publishing flattering scores; expect it to work with `qwen2.5vl:3b` or larger, and treat it as advisory either way.
 - **Chat history is local and unencrypted.** `history\chat_history.db` stores questions, answers and evidence excerpts in plain SQLite. Fine for one reviewer on one machine; do not put it on a shared drive without encrypting it.
 - **Whisper `base` on CPU** is accurate enough for clean speech but will struggle with noise, accents and overlapping speakers. Raise `WHISPER_MODEL_SIZE` to `small` if you have the RAM.
+- **The guards compare text, not meaning.** Coverage checks that a question's years and figures appear in the evidence; the entity guard compares names; the temporal guard compares a passage's period against the question's. A paraphrase that drops the year entirely can pass the temporal guard, and none of them can tell that a number present in the evidence is attached to the wrong subject. They are a floor under answer quality, not a proof of it — citations remain the thing to read.
+- **Structure-aware chunking currently loses, on measurement.** It improves retrieval and loses answers at this model size (13 PASS / 3 CHECK against 16 / 0), so `CHUNKING_MODE=fixed` ships and `structure` stays opt-in. §10 has both runs and the reason. A larger local model is the variable that would change the verdict, not the mechanism.
+- **The React UI is served over plain HTTP.** Same as the API: put TLS in front of it if it is reachable off-machine. The bundle makes no external request of any kind — no CDN, no font, no analytics — so it works with the network unplugged.
 
 ---
 
@@ -404,25 +472,35 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup_windows.ps1                    # or: -Model qwen2.5:1.5b
 
 # every use (offline)
-.\start.ps1                            # UI http://localhost:8501
-.\start.ps1 -UiOnly                    # lighter
+.\start.ps1                            # React UI :8000/ui + Streamlit :8501
+.\start.ps1 -ApiOnly                   # API + React UI only
+.\start.ps1 -NoBrowser                 # do not open a browser window
 
-# checks
+# checks, cheapest first
+.\.venv\Scripts\python scripts\selftest.py             # 86 checks, no model or network
+.\.venv\Scripts\python scripts\apitest.py               # 30 checks on the API + React UI
+.\.venv\Scripts\python scripts\apitest.py --with-query  # +2 more, needs Ollama
 .\.venv\Scripts\python scripts\verify_env.py
 .\.venv\Scripts\python scripts\prepare_models.py
 .\.venv\Scripts\python scripts\ingest_demo.py --dir "D:\my files"
 .\.venv\Scripts\python scripts\smoke_test.py
 .\.venv\Scripts\python scripts\verify_offline.py
 .\.venv\Scripts\python evaluation.py
-.\.venv\Scripts\python evaluation.py --judge          # advisory judge columns
+.\.venv\Scripts\python evaluation.py --compare         # the gate: exit 0 = ship
+.\.venv\Scripts\python evaluation.py --judge           # advisory judge columns
+.\.venv\Scripts\python scripts\manifest.py             # the build behind a result
 .\.venv\Scripts\python scripts\create_user.py --list    # local accounts
+
+# rebuild the demo kit ZIP from this checkout
+.\.venv\Scripts\python scripts\build_kit.py --list      # what would ship
+.\.venv\Scripts\python scripts\build_kit.py --report report_20261105_200057
 ```
 
-Ports: **8501** UI · **8000** API · **11434** Ollama.
+Ports: **8000** API + React UI (`/ui`) · **8501** Streamlit operator UI · **11434** Ollama.
 
 ---
 
-## 9. Corpus lifecycle, the evaluation gate, and chunking
+## 10. Corpus lifecycle, the evaluation gate, and chunking
 
 ### Updating a file that is already indexed
 
@@ -488,11 +566,115 @@ from wrapped PDF lines are never cut mid-sentence, table rows stay whole with th
 header row repeated onto every chunk, and `chunk_size` is a cap rather than a target.
 It also fixes the old splitter's mid-word cuts (`Extr|action`, `HT|ML`).
 
-It is **not the default**, on measurement. On dataset v2.0 it improved every retrieval
-metric — precision .3115 → .3240, MRR .615 → .672, citation accuracy .414 → .492,
-forbidden leaks .1875 → .125 — and cut answer correctness .8125 → .6458, so
-`--compare` failed it. The cause is known: finer chunks mean more items per file, and
-`mmr_max_per_source` (2) then keeps only two of them, so the one chunk holding the
-answer loses its slot to its own siblings. The fix is a wider per-source fan-out or
-small-to-big parent/child retrieval (`ContentItem.parent_id` already exists for it).
-Until that is measured, `CHUNKING_MODE=fixed` ships and `structure` stays opt-in.
+It is **not the default**, on measurement — and both the diagnosis and the fix below
+were carried through to a second measurement rather than left as a theory.
+
+Run 1 (63-81 items per deck, no parents): retrieval improved — precision .3115 → .3240,
+MRR .615 → .672, citation accuracy .414 → .492, forbidden leaks .1875 → .125 — and answer
+correctness fell .8125 → .6458, so `--compare` failed it. The cause was as suspected:
+finer chunks mean more items per file, and `mmr_max_per_source` (2) kept only two of
+them, so the chunk holding the answer lost its slot to its own siblings. Two fragments
+also invented facts — a title slide split so finely that the model supplied an
+affiliation ("UC Berkeley") that appears nowhere in the corpus.
+
+Both fixes were implemented and measured:
+
+- `STRUCTURE_MIN_CHUNK_CHARS=200` — a floor below which structure fragments are merged
+  into a neighbour. 63 items became 30 with a 290-character median, and the invented
+  affiliation disappeared.
+- `MMR_MAX_PER_SOURCE_STRUCTURE=4` — a wider per-source fan-out in structure mode only,
+  since several small blocks from different sections of one file are legitimately
+  different evidence.
+- **Small-to-big parent/child retrieval** (`parents.py`, `PARENT_EXPANSION_ENABLED`):
+  each block's enclosing section is stored as a parent row at index time, retrieval
+  matches the short passage, and generation reads the wider section. The matched passage
+  is kept **separate** in `metadata["retrieved_texts"]`, which turned out to be the part
+  that matters — see below.
+
+Run 2 (42 items, 9 parents): precision .3635, MRR .7031, citation accuracy .7323,
+groundedness 1.0, abstention 1.0 — and still **13 PASS / 3 CHECK** against 16 / 0 for
+`fixed`, so the gate failed it again. Q9 leaked a forbidden figure: a parent section
+spanning 2023 and 2024 made a wrong-year answer look supported, because the temporal
+guard was judging the whole block. Judging the **matched passage** instead closed that
+(a probe afterwards: Q9 abstains). Q10 still produced a confident "87%" for a figure the
+evidence does not contain, and Q16 still denied a limitation that is printed in the deck,
+at confidence 0.004.
+
+So the honest summary is: structure mode retrieves better and, at `qwen2.5:0.5b`, answers
+worse — more context gives a small model more room to confabulate. `CHUNKING_MODE=fixed`
+ships, `structure` stays opt-in, both runs are in `evaluation\reports\`, and the
+mechanism stays in the codebase because the variable that failed here is the model size,
+not the design. Switching modes needs a reindex: `python scripts\reindex.py --yes`.
+
+---
+
+## 11. Observability: the trace and the manifest
+
+Two artefacts, both offline, both already wired into every answer.
+
+### The stage trace
+
+Every `POST /query` response carries `stages`; the React UI renders it under each answer
+and the Streamlit history replay shows the stored copy. Fifteen ordered stages, each with
+its milliseconds, what it moved, and whether it ran:
+
+```
+representation      ran    0.0 ms
+retrieval           ran    16.6 ms    10 candidate item(s)
+rerank              ran    458.9 ms   10 scored, top 10 kept
+abstention_gate     ran    -          best rerank score +7.628 vs -6.0 -> passed
+mmr                 ran    46.9 ms    5 item(s) selected, cap 2 per source
+period_targeting    ran    0.0 ms
+parent_expansion    ran    0.0 ms     5 context block(s); no parent sections in this index
+relationships       ran    2.1 ms     8 evidence item(s) to the model
+coverage_guard      ran    0.0 ms
+entity_guard        ran    0.0 ms
+generation          ran    10580.2 ms
+repetition_guard    ran    0.0 ms
+temporal_guard      ran    0.0 ms
+synthesis           ran    0.0 ms
+citations           ran    65.3 ms    2 citation(s)
+total               ran    11178.6 ms answered
+decision            ran    -          period targeting: question names 2025; 2 evidence item(s) mentioning it were shown first
+```
+
+A stage that did not run says **"not reached"**; a stage switched off in `.env` says
+**"disabled by `entity_guard_enabled`"**. Those are different facts and the trace keeps
+them apart, otherwise "the guard did not fire" and "the guard is off" look identical.
+
+Refusals carry the same trace, including their total time, which is the part worth
+showing an audience:
+
+```
+decision   entity guard: question asks about Project Beta; evidence only mentions Alpha
+total      713.7 ms   abstained (INSUFFICIENT_EVIDENCE)
+```
+
+Answer generation is listed as *not reached* — the model was never called, and the trace
+proves it rather than asserting it.
+
+### The run manifest
+
+The exact build behind a result: git commit and whether the tree is dirty, platform,
+Python, all four model names, every retrieval, chunking, guard, generation and auth
+setting, index counts and dataset version. Three ways to get it, all identical:
+
+```powershell
+.\.venv\Scripts\python scripts\manifest.py              # print it
+.\.venv\Scripts\python scripts\manifest.py --json --out build.json
+curl.exe -H "Authorization: Bearer eai_..." http://127.0.0.1:8000/manifest
+```
+
+It is also embedded in **every evaluation report** (`report["manifest"]`), shown in the
+React UI's Health & build panel and in the Streamlit sidebar. That is what makes a score
+quotable: `report_20261105_200057` records commit `67be890` with a dirty tree, which is
+the work now committed as `a956ae7` — checkable, not claimed.
+
+### Host headroom
+
+`GET /health` reports CPU count, total and available RAM, free disk, uptime, auth mode,
+chunking mode, dataset version and every guard flag, and it **degrades** from `ok` to
+`degraded` with a note when free disk is under 200 MB or available RAM under 512 MB —
+because "the service answered 200" is not the same as "the service can still write to its
+index". It loads no model and makes no call beyond the backend probe it already did, so
+it is safe to poll.

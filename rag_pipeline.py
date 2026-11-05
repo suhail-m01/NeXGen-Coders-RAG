@@ -78,6 +78,22 @@ def last_technical_detail() -> str:
     return getattr(_local, "technical_detail", "")
 
 
+def _count(**kwargs) -> None:
+    """Record per-stage item counts for the trace (observability.stage_trace).
+
+    Thread-local like the technical detail, so concurrent API requests cannot
+    read each other's counts.
+    """
+    counts = getattr(_local, "stage_counts", None)
+    if counts is None:
+        counts = _local.stage_counts = {}
+    counts.update(kwargs)
+
+
+def last_stage_counts() -> dict:
+    return getattr(_local, "stage_counts", {})
+
+
 class RAGPipeline:
     """Owns the store and the stateless stages. Models load lazily on first
     use and are then reused for the life of the process."""
@@ -246,6 +262,22 @@ class RAGPipeline:
 
         try:
             self.store.add_source(result.source)
+
+            # Parents are built here rather than in each extractor so that every
+            # modality gets the same treatment from one place: a document's
+            # sections, a transcript's segments, a table's rows. Must run before
+            # add_items, which persists each child's parent_id.
+            if (
+                settings.parent_expansion_enabled
+                and settings.chunking_mode.strip().lower() == "structure"
+            ):
+                from parents import assign_parents
+
+                result.items, parents = assign_parents(result.items)
+                if parents:
+                    self.store.add_parents(parents)
+                    result.parents = parents
+
             vectors = embed_items(result.items)
             stored = self.store.add_items(result.items, vectors)
 
@@ -340,8 +372,32 @@ class RAGPipeline:
         """
         grounded = self._ground(request, backend)
         if isinstance(grounded, QueryResponse):
-            return grounded
-        return self._finish(grounded)
+            return self._observe(grounded)
+        return self._observe(self._finish(grounded))
+
+    def _observe(self, response):
+        """Attach the stage trace to a response on its way out.
+
+        Applied at the two funnels (query and query_stream) rather than at each
+        return site, so an early abstention carries the same trace as a full
+        answer -- and the stages that never ran are listed as not reached, which
+        is the point of the artefact.
+        """
+        if not isinstance(response, QueryResponse):
+            return response
+        from observability import stage_trace
+
+        counts = dict(last_stage_counts())
+        if "outcome" not in counts:
+            if response.abstained:
+                code = response.error_code.value if response.error_code else "abstained"
+                counts["outcome"] = f"abstained ({code})"
+            else:
+                counts["outcome"] = "answered"
+        response.stages = stage_trace(
+            response.latency_ms or {}, counts=counts, detail=last_technical_detail()
+        )
+        return response
 
     def query_stream(self, request: QueryRequest, backend=None):
         """query(), but yielding answer tokens as they are generated.
@@ -352,7 +408,7 @@ class RAGPipeline:
         """
         grounded = self._ground(request, backend)
         if isinstance(grounded, QueryResponse):
-            yield grounded
+            yield self._observe(grounded)
             return
         yield from self._finish_stream(grounded)
 
@@ -372,13 +428,24 @@ class RAGPipeline:
         provider = get_provider(backend)
         _set_technical_detail("")  # never leak detail from a previous query
         reset_guard_detail()       # same for the numeric guard's caveat detail
+        _local.stage_counts = {}   # same for the stage trace
 
         timings: dict[str, float] = {}
         started = time.perf_counter()
 
+        def _refuse(**kwargs) -> QueryResponse:
+            """An early exit, timed like a full answer.
+
+            Every refusal path goes through here so the trace carries an end-to-end
+            duration: how long the system took to decide it would not answer is
+            exactly what an operator compares against a slow generation.
+            """
+            timings["total_ms"] = (time.perf_counter() - started) * 1000
+            return QueryResponse(**kwargs)
+
         text = request.query.strip()
         if not text or len(text) > settings.max_query_chars:
-            return QueryResponse(
+            return _refuse(
                 answer="Query must be between 1 and "
                        f"{settings.max_query_chars} characters.",
                 abstained=True,
@@ -390,13 +457,13 @@ class RAGPipeline:
         try:
             representation = self.build_query_representation(request)
         except Exception as exc:
-            return QueryResponse(
+            return _refuse(
                 answer=f"Could not read the supplied query file: {exc}",
                 abstained=True,
                 error_code=ErrorCode.INVALID_QUERY,
             )
         if not representation:
-            return QueryResponse(
+            return _refuse(
                 answer="Empty query.", abstained=True,
                 error_code=ErrorCode.INVALID_QUERY,
             )
@@ -412,9 +479,10 @@ class RAGPipeline:
             collection=request.collection,
         )
         timings["retrieval_ms"] = (time.perf_counter() - mark) * 1000
+        _count(retrieved=len(retrieved))
 
         if not retrieved:
-            return QueryResponse(
+            return _refuse(
                 answer=ABSTENTION_MESSAGE,
                 abstained=True,
                 error_code=ErrorCode.INSUFFICIENT_EVIDENCE,
@@ -435,6 +503,7 @@ class RAGPipeline:
 
         best_score = reranked[0].rerank_score if reranked else -99.0
         confidence = score_to_confidence(best_score)
+        _count(rerank_pool=len(retrieved), reranked=len(reranked), best_score=best_score)
 
         # 4. Abstention gate -- before any LLM call. OCR-derived image evidence
         #    scores on a lower scale than text evidence (measured gap of ~6
@@ -447,8 +516,9 @@ class RAGPipeline:
             if top_modality is Modality.IMAGE
             else settings.abstention_threshold
         )
+        _count(threshold=threshold)
         if best_score < threshold:
-            return QueryResponse(
+            return _refuse(
                 answer=ABSTENTION_MESSAGE,
                 retrieved_items=reranked,
                 abstained=True,
@@ -463,10 +533,58 @@ class RAGPipeline:
             from mmr import mmr_select
 
             mark = time.perf_counter()
+            cap = (
+                settings.mmr_max_per_source_structure
+                if settings.chunking_mode.strip().lower() == "structure"
+                else None
+            )
             reranked = mmr_select(
-                representation, reranked, request.rerank_top_k
+                representation, reranked, request.rerank_top_k, max_per_source=cap
             )
             timings["mmr_ms"] = (time.perf_counter() - mark) * 1000
+            _count(
+                mmr_selected=len(reranked),
+                mmr_cap=cap if cap is not None else settings.mmr_max_per_source,
+            )
+
+        # 4c. Period targeting. Order only, and deliberately after the
+        #     abstention gate and MMR: confidence comes from the reranker's best
+        #     score and MMR selects on score, so neither is disturbed. What
+        #     changes is which block the model reads first, and a small model
+        #     answers from EVIDENCE 1 -- measured, the row for Q3 2024 reranks at
+        #     +2.76 while a page containing the more famous 99.4 reranks at
+        #     +4.74, and the model quotes the page.
+        if settings.period_targeting_enabled:
+            from constraint_guard import reorder_by_period_keys
+
+            mark = time.perf_counter()
+            reranked, targeting = reorder_by_period_keys(reranked, request.query)
+            timings["period_targeting_ms"] = (time.perf_counter() - mark) * 1000
+            if targeting.message:
+                _set_technical_detail(targeting.message)
+
+        # 4d. Parent expansion. Retrieval stays fine-grained -- that is what
+        #     raised precision and MRR when structure-aware chunking was measured
+        #     -- but the model reads the complete section each selected chunk came
+        #     from. Without it, a four-row table reaches the model as two rows and
+        #     "which quarter used the most budget?" becomes a guess. Order and
+        #     scores are inherited from the children, so the abstention decision
+        #     above and the period targeting beside it still hold.
+        if settings.parent_expansion_enabled:
+            from parents import expand_to_parents
+
+            mark = time.perf_counter()
+            reranked, expansion = expand_to_parents(self.store, reranked)
+            timings["parent_expansion_ms"] = (time.perf_counter() - mark) * 1000
+            _count(
+                evidence_blocks=len(reranked),
+                parent_sections=sum(
+                    1 for result in reranked
+                    if result.item.metadata.get("is_parent")
+                ),
+            )
+            if expansion.message:
+                _set_technical_detail(expansion.message)
 
         # 5. Relationship expansion
         mark = time.perf_counter()
@@ -476,6 +594,7 @@ class RAGPipeline:
         final_evidence = expanded[: settings.max_context_items
                                   + settings.max_relationship_expansion]
         timings["relationships_ms"] = (time.perf_counter() - mark) * 1000
+        _count(final_evidence=len(final_evidence))
 
         # 5b. Deterministic coverage guard. The score gate cannot see temporal
         #     traps ("budget in 2040?" scores like a genuine question), but a
@@ -495,11 +614,43 @@ class RAGPipeline:
                     "coverage guard: question numbers absent from evidence: "
                     + ", ".join(missing)
                 )
-                return QueryResponse(
+                return _refuse(
                     answer=(
                         "I found no evidence covering "
                         + ", ".join(missing)
                         + " in the available sources, so I will not guess."
+                    ),
+                    retrieved_items=reranked,
+                    relationships=relationships,
+                    abstained=True,
+                    confidence=confidence,
+                    error_code=ErrorCode.INSUFFICIENT_EVIDENCE,
+                    query_representation=representation,
+                    latency_ms=timings,
+                )
+
+        # 5c. Entity near-miss gate. The numeric guard checks figures against
+        #     evidence; nothing checked names, so "how many engineers were on the
+        #     Project Beta team" was answered with Alpha's six. Refusing here
+        #     rather than after generation also saves the LLM call.
+        if settings.entity_guard_enabled:
+            from constraint_guard import entity_mismatch
+
+            mark = time.perf_counter()
+            mismatch = entity_mismatch(
+                request.query, [e.item.content for e in final_evidence]
+            )
+            timings["entity_guard_ms"] = (time.perf_counter() - mark) * 1000
+            if mismatch:
+                _set_technical_detail(
+                    f"entity guard: question asks about {mismatch.asked}; "
+                    f"evidence only mentions {', '.join(mismatch.found)}"
+                )
+                return _refuse(
+                    answer=(
+                        f"I found no evidence about {mismatch.asked}. The sources "
+                        f"indexed here describe {', '.join(mismatch.found[:3])}, "
+                        f"so I will not answer for {mismatch.asked}."
                     ),
                     retrieved_items=reranked,
                     relationships=relationships,
@@ -546,7 +697,7 @@ class RAGPipeline:
             return provider.generate_stream(*args, **kwargs)
         return provider.generate(*args, **kwargs)
 
-    def _assemble(self, state: dict, answer: str) -> QueryResponse:
+    def _assemble(self, state: dict, answer: str, streamed: bool = False) -> QueryResponse:
         """Steps 7-8: model-signalled abstention, then programmatic citations."""
         from citations import build_citations
 
@@ -563,11 +714,103 @@ class RAGPipeline:
                 latency_ms=timings,
             )
 
+        # Step 7 pre: collapse a looping generation before anything else reads
+        #     the answer. Every stage downstream -- the temporal guard, the
+        #     completion aid, citations and the numeric guard -- would otherwise
+        #     process pages of duplicate text, and the loop's own list ordinals
+        #     get reported as figures missing from the evidence.
+        if settings.repetition_guard_enabled:
+            from repetition_guard import collapse_repetition
+
+            mark = time.perf_counter()
+            answer, repetition = collapse_repetition(answer)
+            timings["repetition_guard_ms"] = (time.perf_counter() - mark) * 1000
+            if repetition.message:
+                _set_technical_detail(repetition.message)
+
+        # Step 7a: temporal verification. The answer can be perfectly grounded
+        # and still be about the wrong period: every figure in it comes from
+        # evidence that mentions a different year or quarter than the question
+        # asked. Batch mode replaces the answer with a refusal; a stream has
+        # already shown the text to the user, so it gets an explicit correction
+        # appended instead of being silently swapped.
+        temporal = None
+        if settings.temporal_guard_enabled:
+            from constraint_guard import temporal_violation
+
+            # Judged against the passages that matched, not the whole context
+            # block: parent expansion adds the surrounding section, and a section
+            # spanning two years would make an answer about the wrong year look
+            # supported. With no parents (fixed chunking) this is the item text.
+            passages: list[str] = []
+            for result in state["final_evidence"]:
+                passages.extend(
+                    result.item.metadata.get("retrieved_texts")
+                    or [result.item.content]
+                )
+            mark = time.perf_counter()
+            temporal = temporal_violation(
+                state["request"].query, answer, passages
+            )
+            state["timings"]["temporal_guard_ms"] = (time.perf_counter() - mark) * 1000
+            if temporal:
+                _set_technical_detail(
+                    "temporal guard: question asks about "
+                    + ", ".join(temporal.asked)
+                    + "; the evidence supporting "
+                    + ", ".join(temporal.numbers)
+                    + " describes "
+                    + (", ".join(temporal.found) or "another period")
+                )
+            if temporal and not streamed:
+                state["timings"]["total_ms"] = (
+                    time.perf_counter() - state["started"]
+                ) * 1000
+                return QueryResponse(
+                    answer=(
+                        f"The sources describe {', '.join(temporal.found[:3]) or 'a different period'}, "
+                        f"not the {', '.join(temporal.asked[:2])} you asked about, "
+                        f"so their figures ({', '.join(temporal.numbers[:3])}) do not "
+                        f"answer this question and I will not guess."
+                    ),
+                    retrieved_items=state["reranked"],
+                    relationships=state["relationships"],
+                    abstained=True,
+                    confidence=state["confidence"],
+                    error_code=ErrorCode.INSUFFICIENT_EVIDENCE,
+                    query_representation=state["representation"],
+                    latency_ms=state["timings"],
+                )
+
+        # Step 7b: evidence completion. A broad question retrieves several
+        #     sources that state the same figures, and a small model answers from
+        #     the first block. Measured: for such a question the answer came back
+        #     byte-identical with and without a prompt-side digest of the shared
+        #     figures, so the aid is applied to the answer instead, where it does
+        #     not depend on the model following an instruction. Appends only
+        #     figures two or more sources state independently, each labelled with
+        #     the file and location; skipped when the temporal guard fired,
+        #     because that answer is already flagged as the wrong period.
+        if settings.synthesis_completion_enabled and not temporal:
+            from synthesis import complete_answer
+
+            mark = time.perf_counter()
+            answer, completion = complete_answer(
+                answer,
+                state["final_evidence"],
+                state["filenames"],
+                state["request"].query,
+            )
+            timings["synthesis_ms"] = (time.perf_counter() - mark) * 1000
+            if completion.message:
+                _set_technical_detail(completion.message)
+
         mark = time.perf_counter()
         citations, _sentence_map = build_citations(
             answer, state["final_evidence"], state["filenames"]
         )
         timings["citations_ms"] = (time.perf_counter() - mark) * 1000
+        _count(citations=len(citations))
 
         # Step 7b: numeric verification guard. It runs after citations and its
         # caveat is appended afterwards, so a disclaimer can neither attract a
@@ -580,6 +823,15 @@ class RAGPipeline:
             sorted(set(state["filenames"].values())),
             question=state["request"].query,
         )
+
+        if temporal and streamed:
+            # Already on screen: correct it in place rather than pretend it was
+            # never said.
+            answer = (
+                f"{answer}\n\nCorrection: those figures describe "
+                f"{', '.join(temporal.found[:3]) or 'a different period'}, not the "
+                f"{', '.join(temporal.asked[:2])} asked about."
+            )
 
         timings["total_ms"] = (time.perf_counter() - state["started"]) * 1000
 
@@ -633,10 +885,10 @@ class RAGPipeline:
                 chunks.append(chunk)
                 yield chunk
         except ProviderError as exc:
-            yield self._provider_error_response(state, exc)
+            yield self._observe(self._provider_error_response(state, exc))
             return
         state["timings"]["generation_ms"] = (time.perf_counter() - mark) * 1000
-        yield self._assemble(state, "".join(chunks))
+        yield self._observe(self._assemble(state, "".join(chunks), streamed=True))
 
     # ----------------------------------------------------------------- lookup
 

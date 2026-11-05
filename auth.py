@@ -236,6 +236,14 @@ class UserStore:
             cursor = self._conn.execute(
                 "DELETE FROM users WHERE username = ?", (username,)
             )
+            # Tokens must not outlive the account. authenticate_token already
+            # refuses a token whose user is gone, but leaving the hashes behind
+            # keeps credential material in a database an operator believes is
+            # clean -- found by inspection after a test account was deleted and
+            # its revoked token row survived.
+            self._conn.execute(
+                "DELETE FROM api_tokens WHERE username = ?", (username,)
+            )
             self._conn.commit()
         if not cursor.rowcount:
             raise AuthError(f"No account named '{username}'.")
@@ -292,6 +300,26 @@ class UserStore:
             "Failed login for '%s' (%s)", row["username"],
             "now locked" if lock else f"attempt {attempts}",
         )
+        return None
+
+    def locked_until(self, username: str) -> str | None:
+        """ISO timestamp this account is locked until, or None if it is not.
+
+        `authenticate` answers None for a wrong password AND for a locked account,
+        which is deliberate: neither outcome should confirm the other, and a
+        missing account is hashed anyway so usernames are not enumerable by
+        timing. A caller that needs to tell a legitimate user "stop trying for
+        five minutes" asks here instead -- otherwise that user keeps mistyping and
+        keeps the lock alive.
+        """
+        row = self.get((username or "").strip())
+        if row is None or not row["locked_until"]:
+            return None
+        try:
+            if _now() < datetime.fromisoformat(row["locked_until"]):
+                return row["locked_until"]
+        except ValueError:
+            return None
         return None
 
     # ---- API tokens -----------------------------------------------------

@@ -160,7 +160,10 @@ def ollama_generate(
 
     `max_tokens` caps the reply. The LLM judge uses it: a small model asked a
     yes/no question will otherwise keep doing the underlying task instead of
-    answering, and a hard cap is what keeps its reply parseable.
+    answering, and a hard cap is what keeps its reply parseable. Everything else
+    falls back to `ollama_num_predict`, because an uncapped small model that
+    starts repeating itself generates until the context is full -- measured at
+    over five minutes for one query, long enough for Ollama to return 500.
     """
     payload: dict = {
         "model": settings.ollama_model,
@@ -171,7 +174,11 @@ def ollama_generate(
             "num_ctx": settings.ollama_num_ctx,
             "temperature": settings.ollama_temperature,
             **({"seed": settings.ollama_seed} if settings.ollama_seed > 0 else {}),
-            **({"num_predict": max_tokens} if max_tokens else {}),
+            **(
+                {"num_predict": max_tokens or settings.ollama_num_predict}
+                if (max_tokens or settings.ollama_num_predict > 0)
+                else {}
+            ),
         },
     }
 
@@ -210,6 +217,13 @@ def ollama_generate_stream(prompt: str, image_paths: list[Path] | None = None):
             "num_ctx": settings.ollama_num_ctx,
             "temperature": settings.ollama_temperature,
             **({"seed": settings.ollama_seed} if settings.ollama_seed > 0 else {}),
+            # A stream needs the same cap: the tokens go to the screen as they
+            # arrive, so a repetition loop is visible for minutes.
+            **(
+                {"num_predict": settings.ollama_num_predict}
+                if settings.ollama_num_predict > 0
+                else {}
+            ),
         },
     }
 

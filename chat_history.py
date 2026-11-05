@@ -137,6 +137,12 @@ def build_trace(request, response, filenames: dict[str, str]) -> dict:
             }
             for relationship in response.relationships[: settings.max_relationship_expansion]
         ],
+        # The pipeline's own stage trace, so a replayed answer shows which gate
+        # decided it and how long each stage took -- not just what was retrieved.
+        "abstained": response.abstained,
+        "confidence": response.confidence,
+        "latency_ms": dict(getattr(response, "latency_ms", {}) or {}),
+        "stages": list(getattr(response, "stages", []) or []),
     }
 
 

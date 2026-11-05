@@ -24,7 +24,6 @@ httptools==0.8.0
 httpx==0.28.1
 huggingface_hub==1.29.0
 idna==3.19
-iniconfig==2.3.0
 itsdangerous==2.2.0
 Jinja2==3.1.6
 joblib==1.5.3
@@ -44,7 +43,6 @@ opencv-python-headless==5.0.0.93
 packaging==26.3
 pandas==3.0.5
 pillow==12.3.0
-pluggy==1.6.0
 protobuf==7.36.0
 pyarrow==25.0.1
 pydantic-settings==2.15.0
@@ -55,7 +53,6 @@ Pygments==2.21.0
 pymupdf==1.28.2
 pypiwin32==223
 pytesseract==0.3.13
-pytest==9.1.1
 python-dateutil==2.9.0.post0
 python-docx==1.2.0
 python-dotenv==1.2.3

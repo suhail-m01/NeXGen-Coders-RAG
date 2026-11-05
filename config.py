@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # One image costs ~1030 prompt tokens; the 4096 default leaves too
     # little room for text evidence alongside it.
     ollama_num_ctx: int = 8192
+    # Hard cap on generated tokens for an answer. Measured, not cosmetic: with no
+    # cap a 0.5b model that falls into a repetition loop keeps generating until
+    # the context fills, which on 2 CPUs took over five minutes and made Ollama
+    # itself answer 500 after its own write timeout -- one bad query could stall
+    # a whole demo. Every answer this system produces is far shorter than this.
+    ollama_num_predict: int = 512
     ollama_temperature: float = 0.0
     # A fixed seed makes answers reproducible run-to-run. Essential for an
     # evidence tool and for comparing evaluation reports. Set <= 0 to let the
@@ -112,22 +118,36 @@ class Settings(BaseSettings):
     # modes; chunk_overlap only applies where a block had to be cut, because
     # structure-aware chunking already breaks at seams.
     #
-    # Default is "fixed" on measurement, not preference. Structure-aware chunking
-    # improved every retrieval metric (precision .3115 -> .3240, MRR .615 ->
-    # .672, citation accuracy .414 -> .492, forbidden leaks .1875 -> .125) and
-    # fixed the old splitter's mid-word cuts, but it cut answer correctness
-    # 0.8125 -> 0.6458 on dataset v2.0 and evaluation.py --compare failed it.
-    # Cause: finer chunks mean more items per file, and mmr_max_per_source then
-    # keeps only two of them, so the one chunk holding the answer loses its slot
-    # to its own siblings. It stays in the tree as an opt-in because the fix is
-    # known (wider retrieval fan-out per source, or small-to-big parent/child
-    # retrieval), not because it is finished.
+    # Default is "fixed" on measurement, not preference -- and the measurement has
+    # now been made twice. The known fix for structure-aware chunking is built:
+    # parents.py collapses retrieved chunks into their complete section
+    # (small-to-big), the per-source fan-out is wider under "structure", and the
+    # fragment floor is 200 characters instead of 40. With all of that in place
+    # structure mode retrieves clearly better than fixed -- precision .3635 vs
+    # .3115, MRR .7031 vs .6146, citation accuracy .7323 vs .4135 -- and still
+    # loses the gate at 13/16 PASS against 16/16: a question whose answer is
+    # absent from the corpus was answered "87%" instead of refused, the deck
+    # fragments behind one paper question scored -5.5 (inside the calibrated -6.0
+    # abstention threshold, so no refusal) and the model then denied the
+    # limitation exists, and cross-modal recall fell .75 -> .50.
+    # The lesson is that richer context helps a small model find a fact and helps
+    # it confabulate at the same time, so structure mode ships opt-in rather than
+    # as the default: set CHUNKING_MODE=structure for a long, well-headed corpus
+    # asked lookup questions, and re-measure with evaluation.py --compare.
     # Changing this changes how every document splits: run scripts/reindex.py
     # afterwards, since ingestion skips already-indexed files by content hash.
     chunking_mode: str = "fixed"
     chunk_size: int = 800
     chunk_overlap: int = 100
     min_chunk_chars: int = 40
+    # Structure-aware chunking needs a much higher floor. Measured on the demo
+    # deck: with the shared floor of 40 a 22-page slide deck produced 63 items
+    # with a median of 85 characters, and two queries failed because of it -- the
+    # title slide split so the university name reached the model without its
+    # label (it invented "UC Berkeley"), and the limitations paragraph split so
+    # no fragment scored above the abstention threshold (it refused). A fragment
+    # that small carries a heading but not the sentence that answers anything.
+    structure_min_chunk_chars: int = 200
 
     # ---- Retrieval ----------------------------------------------------
     top_k: int = 10
@@ -147,6 +167,16 @@ class Settings(BaseSettings):
     mmr_enabled: bool = True
     mmr_lambda: float = 0.7
     mmr_max_per_source: int = 2
+    # Structure-aware chunking cuts a table into one chunk per row, so a cap of
+    # two rows per file can leave the row that answers the question behind. Under
+    # "structure" the cap is wider, and parents.py then collapses the selected
+    # chunks into complete sections, so the extra chunks cost context only when
+    # they come from different sections.
+    mmr_max_per_source_structure: int = 4
+    # Small-to-big retrieval: build and expand parent sections. Inert in fixed
+    # chunking, where no parent rows exist.
+    parent_expansion_enabled: bool = True
+    parent_max_chars: int = 1800
 
     # ---- Relationships ------------------------------------------------
     related_to_threshold: float = 0.70
@@ -177,6 +207,22 @@ class Settings(BaseSettings):
     # It never deletes or refuses an answer -- a false positive costs one
     # sentence, a silently wrong number costs trust.
     numeric_guard_enabled: bool = True
+    # Cut a looping generation at its first duplicated paragraph. A 0.5b model at
+    # temperature 0 lands in repetition loops on some calls; see repetition_guard.
+    repetition_guard_enabled: bool = True
+    # Question-constraint guards (constraint_guard.py). The score gate cannot see
+    # a near-miss period or a renamed entity: both retrieve at high confidence
+    # and both produce a fluent, grounded, wrong answer.
+    entity_guard_enabled: bool = True      # "Project Beta" vs a corpus of Alpha
+    temporal_guard_enabled: bool = True    # 2023 asked, 2024's figures answered
+    period_targeting_enabled: bool = True  # show period-matching evidence first
+    # Evidence-completion aid for broad multi-source questions: appends the
+    # corroborated figures the answer omitted, each labelled with the files that
+    # state it. A prompt-level version of this was measured first and produced a
+    # byte-identical answer at qwen2.5:0.5b, so the aid is applied to the answer
+    # instead of the prompt. Fires only on synthesis phrasing (see
+    # synthesis.SYNTHESIS_MARKERS), never on a lookup question.
+    synthesis_completion_enabled: bool = True
     # Figures shorter than this are ignored ("3 items", "page 5"): short
     # numbers are too easy to paraphrase legitimately to police.
     numeric_guard_min_digits: int = 2

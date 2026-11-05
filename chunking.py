@@ -350,7 +350,11 @@ def split_document(
     """
     cap = max_chars or settings.chunk_size
     over = overlap if overlap is not None else settings.chunk_overlap
-    floor = min_chars or settings.min_chunk_chars
+    # This function is the structure-aware path only, so it takes the structure
+    # floor: fixed chunking keeps settings.min_chunk_chars and the baseline it was
+    # measured against. See structure_min_chunk_chars for the deck that proved 40
+    # is too small here.
+    floor = min_chars or settings.structure_min_chunk_chars
     # How much body text must have accumulated before a new heading is allowed to
     # start a chunk. The floor alone is not enough: a slide deck is dozens of
     # short labelled lines, and breaking at every one of them produced 65

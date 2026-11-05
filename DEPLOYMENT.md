@@ -18,7 +18,7 @@ reranking) is local in **both** modes. Only answer generation differs.
 ## 1. Local — both modes
 
 ```powershell
-cd C:\Users\Anish\Documents\EvidenceAI
+cd C:\EvidenceAI
 copy .env.example .env      # then edit .env
 .\start.ps1
 ```
@@ -85,7 +85,50 @@ These are real and worth knowing before you rely on a hosted demo:
 
 ---
 
-## 3. Other hosts
+## 3. The API and the React UI as one service
+
+This is the deployment to prefer for anything beyond a personal laptop: one
+process, one port, no CORS, no second web server.
+
+```bash
+pip install -r requirements.txt
+python -m uvicorn api:app --host 0.0.0.0 --port $PORT
+```
+
+`api.py` serves the built React bundle from `webui/dist` at `/ui`, and `/`
+redirects there. Because the UI is served by the same process it calls, every
+request it makes is a **relative URL** — the bundle contains no host, no port and
+no environment-specific value, so the same `dist/` works behind any prefix, on any
+machine, with no rebuild. `webui/dist` is committed for exactly this reason: a
+deployment needs no Node toolchain. If you do change the UI, rebuild with
+`cd webui && npm install && npm run build`.
+
+Before exposing it off-machine:
+
+- **Keep `API_AUTH_ENABLED=true`.** Every endpoint except `/health`, `/login`,
+  `/logout` and the static UI requires a bearer token bound to a role. `false`
+  makes the service an open door on whatever interface it is bound to.
+- **Put TLS in front of it.** The service speaks plain HTTP; passwords and tokens
+  travel in the clear without a proxy. nginx, Caddy or your platform's TLS
+  termination is the operator's job, and none of it needs a code change.
+- **Create the first account headlessly.** `python scripts/create_user.py <name>
+  <password> --role admin`, then mint tokens for anything that is not a browser.
+- **Persist three directories.** `index/`, `history/` and `auth/` are SQLite plus
+  a FAISS file, and they default to folders beside the code. On a container host,
+  mount volumes for them or every restart loses the corpus, the sessions and the
+  accounts. `INDEX_DIR` can be set independently; the account and history
+  databases are derived from `DATA_DIR`, so moving one moves both.
+- **Give it disk and RAM headroom.** `GET /health` reports free disk, available
+  RAM and uptime, and reports `degraded` rather than `ok` when either is too low
+  for ingestion or model loading. Poll it; it loads no model.
+
+The Streamlit operator UI can run alongside it (`streamlit run app.py`) or not at
+all — the React UI covers asking, evidence, trace, sources and health, while
+Streamlit adds account management, chat-history replay and export.
+
+---
+
+## 4. Other hosts
 
 Any container host works. The application is a normal Streamlit app:
 
@@ -101,7 +144,7 @@ without changing code.
 
 ---
 
-## 4. Security checklist before pushing
+## 5. Security checklist before pushing
 
 ```bash
 git check-ignore .env                                  # must print .env
@@ -112,3 +155,26 @@ git grep -nE "sk-(proj-)?[A-Za-z0-9_-]{20,}" HEAD      # must find nothing
 The key is only ever read from configuration and sent in the `Authorization`
 header. It is never logged, never rendered in the UI, and is redacted from
 API error bodies before they reach a message.
+
+For the local accounts and API tokens:
+
+```bash
+python scripts/create_user.py --list           # who can sign in
+python scripts/create_user.py --list-tokens    # which tokens are live
+python scripts/create_user.py --revoke-token eai_AbCdEfGh
+python scripts/manifest.py --json              # the build you are about to ship
+```
+
+- Passwords are PBKDF2-HMAC-SHA256 with a per-user salt; tokens are stored only
+  as SHA-256 digests and shown once. Deleting an account deletes its tokens in the
+  same call, so a removed user cannot keep a live credential.
+- Five failed sign-ins lock an account for five minutes. A locked account gets
+  HTTP 423 with the unlock time; an unknown account and a wrong password both get
+  401, so the username list is not enumerable by status code.
+- `auth/users.db`, `history/chat_history.db` and `index/` are **unencrypted**.
+  Anyone with the files has the corpus and the session history. Use OS or disk
+  encryption if the material is sensitive, and never commit them.
+- The React UI stores its bearer token in `localStorage` and calls `POST /logout`
+  on sign-out, which revokes the token server-side rather than only forgetting it.
+  That is normal for a browser app and worth knowing: on a shared machine, sign
+  out rather than closing the tab.

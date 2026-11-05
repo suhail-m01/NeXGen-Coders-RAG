@@ -49,6 +49,9 @@ requests>=2.32
 # --- Demo data generation (Windows SAPI speech) ---
 pyttsx3>=2.90
 
-# --- Tests ---
-pytest>=8.0
+# --- Optional: API test client ---
+# httpx is what makes `fastapi.testclient` usable for checking the API by hand.
+# There is no pytest suite in this repository (see README > Verification); the
+# offline checks are scripts/selftest.py, scripts/smoke_test.py,
+# scripts/verify_offline.py and evaluation.py --compare.
 httpx>=0.27
