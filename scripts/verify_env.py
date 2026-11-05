@@ -40,6 +40,9 @@ DEPENDENCIES = [
     ("multipart", "python-multipart", True),
     ("streamlit", "streamlit", True),
     ("requests", "requests", True),
+    ("librosa", "librosa", True),    # diarization.py: MFCC features
+    ("soundfile", "soundfile", True),  # librosa's decoder for WAV/FLAC
+    ("sklearn", "scikit-learn", True),  # diarization.py: clustering
     ("pyttsx3", "pyttsx3", False),   # demo speech only; Windows SAPI
 ]
 
@@ -59,6 +62,16 @@ PROJECT_MODULES = [
     "llm",
     "providers",
     "rag_pipeline",
+    # Added by the upgrade programme. Importing them here is what catches a
+    # missing librosa/scikit-learn or a module-name collision at setup time
+    # instead of at the first audio ingestion.
+    "lexical",
+    "mmr",
+    "diarization",
+    "ocr",
+    "coverage_guard",
+    "numeric_guard",
+    "chat_history",
 ]
 
 

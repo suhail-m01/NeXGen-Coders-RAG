@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS sources (
     source_type TEXT NOT NULL,
     file_path   TEXT NOT NULL,
     mime_type   TEXT,
-    file_size   INTEGER
+    file_size   INTEGER,
+    collection  TEXT NOT NULL DEFAULT 'general'
 );
 
 CREATE TABLE IF NOT EXISTS items (
@@ -83,10 +84,34 @@ class VectorStore:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
         self._index = self._load_or_create_index()
 
     # ---- index lifecycle -------------------------------------------------
+
+    def _migrate(self) -> None:
+        """Add columns that post-date an existing database.
+
+        Indexes are rebuilt often enough that a migration path feels like
+        overkill, but chat history and a curated corpus are not: an index built
+        before collections existed must keep working rather than crash on
+        INSERT arity.
+        """
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(sources)")
+        }
+        if "collection" not in columns:
+            logger.info("Migrating sources table: adding 'collection' column")
+            self._conn.execute(
+                "ALTER TABLE sources ADD COLUMN collection TEXT NOT NULL DEFAULT 'general'"
+            )
+        # Created here, not in SCHEMA: on a legacy database SCHEMA runs before
+        # the ALTER, and an index on a column that does not exist yet is an
+        # error rather than a no-op.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sources_collection ON sources(collection)"
+        )
 
     def _load_or_create_index(self):
         import faiss
@@ -123,13 +148,91 @@ class VectorStore:
     def add_source(self, source: Source) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO sources VALUES (?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO sources VALUES (?,?,?,?,?,?,?)",
                 (
                     source.source_id, source.filename, source.source_type.value,
                     source.file_path, source.mime_type, source.file_size,
+                    source.collection,
                 ),
             )
             self._conn.commit()
+
+    def delete_source(self, source_id: str) -> int:
+        """Remove a source, its items, and every relationship touching them.
+
+        Returns the number of items removed (0 if the source was unknown).
+
+        The index is rebuilt rather than pruned: IndexFlat stores vectors
+        positionally (add_items derives vector_id from ntotal), so removing rows
+        in place would shift every later vector and silently map searches to the
+        wrong items. Reconstructing the survivors keeps the mapping exact for a
+        cost linear in the remaining item count.
+
+        The original file on disk is left alone, and chat history keeps its
+        stored trace -- a deleted source can still be audited after the fact.
+        """
+        import faiss
+
+        with self._lock:
+            victim = self._conn.execute(
+                "SELECT item_id, vector_id FROM items WHERE source_id = ?",
+                (source_id,),
+            ).fetchall()
+            known = self._conn.execute(
+                "SELECT 1 FROM sources WHERE source_id = ?", (source_id,)
+            ).fetchone()
+            if not victim and not known:
+                return 0
+
+            dropped = {
+                row["vector_id"] for row in victim if row["vector_id"] is not None
+            }
+            survivors = sorted(
+                (
+                    (row["item_id"], row["vector_id"])
+                    for row in self._conn.execute(
+                        "SELECT item_id, vector_id FROM items"
+                    ).fetchall()
+                    if row["vector_id"] is not None and row["vector_id"] not in dropped
+                ),
+                key=lambda pair: pair[1],
+            )
+
+            vectors = [
+                self._index.reconstruct(int(vector_id)) for _, vector_id in survivors
+            ]
+            rebuilt = faiss.IndexFlatIP(settings.embedding_dim)
+            if vectors:
+                rebuilt.add(
+                    np.ascontiguousarray(np.vstack(vectors), dtype=np.float32)
+                )
+            self._index = rebuilt
+
+            item_ids = [row["item_id"] for row in victim]
+            if item_ids:
+                placeholders = ",".join("?" * len(item_ids))
+                self._conn.execute(
+                    f"DELETE FROM relationships WHERE source_item_id IN ({placeholders}) "
+                    f"OR target_item_id IN ({placeholders})",
+                    item_ids + item_ids,
+                )
+                self._conn.execute(
+                    f"DELETE FROM items WHERE item_id IN ({placeholders})", item_ids
+                )
+            self._conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))
+
+            for new_id, (item_id, _) in enumerate(survivors):
+                self._conn.execute(
+                    "UPDATE items SET vector_id = ? WHERE item_id = ?",
+                    (new_id, item_id),
+                )
+            self._conn.commit()
+            self.save()
+            logger.info(
+                "Deleted source %s: %d item(s) removed, %d renumbered",
+                source_id, len(item_ids), len(survivors),
+            )
+            return len(item_ids)
 
     def source_exists(self, source_id: str) -> bool:
         row = self._conn.execute(
@@ -254,12 +357,35 @@ class VectorStore:
         ).fetchall()
         return [self._row_to_item(r) for r in rows]
 
+    def all_items(self) -> list[ContentItem]:
+        """Every indexed item, in vector_id order. Used by the lexical leg."""
+        rows = self._conn.execute(
+            "SELECT * FROM items ORDER BY vector_id"
+        ).fetchall()
+        return [self._row_to_item(r) for r in rows]
+
+    def items_signature(self) -> tuple[int, int]:
+        """Cheap change detection for cached derived indexes (e.g. BM25).
+
+        (row count, highest rowid) changes on any insert or delete, which is
+        all a cache needs; re-hashing every document would cost far more than
+        the index it protects.
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM items"
+        ).fetchone()
+        return (int(row[0]), int(row[1]))
+
     def get_source(self, source_id: str) -> Source | None:
         row = self._conn.execute(
             "SELECT * FROM sources WHERE source_id = ?", (source_id,)
         ).fetchone()
         if not row:
             return None
+        return self._source_from_row(row)
+
+    @staticmethod
+    def _source_from_row(row) -> Source:
         return Source(
             source_id=row["source_id"],
             filename=row["filename"],
@@ -267,18 +393,54 @@ class VectorStore:
             file_path=row["file_path"],
             mime_type=row["mime_type"],
             file_size=row["file_size"],
+            collection=row["collection"] or "general",
         )
 
-    def list_sources(self) -> list[Source]:
-        rows = self._conn.execute("SELECT * FROM sources ORDER BY filename").fetchall()
-        return [
-            Source(
-                source_id=r["source_id"], filename=r["filename"],
-                source_type=SourceType(r["source_type"]), file_path=r["file_path"],
-                mime_type=r["mime_type"], file_size=r["file_size"],
-            )
-            for r in rows
-        ]
+    def list_sources(self, collection: str | None = None) -> list[Source]:
+        """Every source, or just those in one collection."""
+        if collection:
+            rows = self._conn.execute(
+                "SELECT * FROM sources WHERE collection = ? ORDER BY filename",
+                (collection,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM sources ORDER BY filename"
+            ).fetchall()
+        return [self._source_from_row(row) for row in rows]
+
+    def sources_by_filename(self, filename: str) -> list[Source]:
+        """Every indexed version of one filename.
+
+        A source_id is a content hash, so editing a file and re-ingesting it
+        produces a *second* source. Without this lookup the stale version stays
+        indexed and keeps being cited next to the new one.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM sources WHERE filename = ? ORDER BY rowid", (filename,)
+        ).fetchall()
+        return [self._source_from_row(row) for row in rows]
+
+    def duplicate_filenames(self) -> dict[str, list[Source]]:
+        """Filenames with more than one indexed version, newest last."""
+        out: dict[str, list[Source]] = {}
+        for source in self.list_sources():
+            out.setdefault(source.filename, []).append(source)
+        return {name: versions for name, versions in out.items() if len(versions) > 1}
+
+    def list_collections(self) -> list[dict]:
+        """Collections present in the index, with source counts."""
+        rows = self._conn.execute(
+            "SELECT collection, COUNT(*) AS sources FROM sources "
+            "GROUP BY collection ORDER BY collection"
+        ).fetchall()
+        return [{"collection": row["collection"], "sources": row["sources"]} for row in rows]
+
+    def source_ids_in_collection(self, collection: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT source_id FROM sources WHERE collection = ?", (collection,)
+        ).fetchall()
+        return {row["source_id"] for row in rows}
 
     def get_relationships_for_items(self, item_ids: list[str]) -> list[Relationship]:
         """Deterministic relationships touching any of the given items."""

@@ -14,7 +14,8 @@ from pathlib import Path
 import streamlit as st
 
 from config import settings
-from schemas import InferenceMode, Modality, QueryModality, QueryRequest, clock
+from schemas import (InferenceMode, Modality, QueryModality, QueryRequest,
+                      QueryResponse, clock)
 
 st.set_page_config(page_title="Evidence AI", page_icon="🔍", layout="wide")
 
@@ -175,6 +176,24 @@ def render_evidence(pipeline, response) -> None:
                     st.markdown("**Visual description (Qwen2.5-VL)**")
                     st.write(description)
                 if ocr_text:
+                    confidence = item.metadata.get("ocr_confidence")
+                    if confidence is not None:
+                        dropped = item.metadata.get("ocr_digits_dropped") or 0
+                        total = item.metadata.get("ocr_digits_total") or 0
+                        upscale = item.metadata.get("ocr_upscale") or 1
+                        st.caption(
+                            f"OCR confidence {confidence:.0f}% · "
+                            f"{item.metadata.get('ocr_words_kept', 0)}/"
+                            f"{item.metadata.get('ocr_words_total', 0)} words kept · "
+                            f"{dropped}/{total} numeric tokens withheld · "
+                            f"upscaled {upscale}x"
+                        )
+                    if item.metadata.get("ocr_unreliable"):
+                        st.warning(
+                            "OCR could not read this image reliably. Numbers may be "
+                            "misread or missing — a figure absent here is not "
+                            "evidence that it is absent from the image."
+                        )
                     st.markdown("**OCR text (Tesseract)**")
                     st.code(ocr_text[:1200])
                 if item.metadata.get("vision_ok") is False:
@@ -212,7 +231,18 @@ def render_response(pipeline, response) -> None:
         if response.error_code:
             st.caption(f"Reason: `{response.error_code.value}`")
     else:
-        st.success("Grounded answer")
+        from numeric_guard import last_guard_detail
+
+        flagged, _searched = last_guard_detail()
+        if flagged:
+            # The caveat is already in the answer text; the badge stops it
+            # being skimmed past, and "Grounded answer" would be a lie.
+            st.warning(
+                "Partially grounded — unverified figure(s): "
+                + ", ".join(flagged)
+            )
+        else:
+            st.success("Grounded answer")
         st.markdown(response.answer)
 
     if response.confidence is not None:
@@ -245,8 +275,369 @@ def render_response(pipeline, response) -> None:
                 st.caption(f"{stage}: {value:.0f} ms")
 
 
+# ---------------------------------------------------------------------------
+# Accounts and roles
+# ---------------------------------------------------------------------------
+
+def current_user() -> dict:
+    return st.session_state.get("user") or {}
+
+
+def render_login() -> dict:
+    """Sign-in gate. Runs before anything else and stops the script for
+    anonymous visitors, so no panel is ever rendered without an account.
+
+    When the user database is empty the form creates the first administrator
+    instead of offering a default password -- shipping credentials would be a
+    hole, not a convenience.
+    """
+    from auth import AuthError, Role, get_user_store
+
+    store = get_user_store()
+    user = st.session_state.get("user")
+    if user:
+        return user
+
+    st.title("🔍 Evidence AI")
+    st.caption("Offline multimodal evidence search. Sign in to continue.")
+
+    if store.needs_bootstrap():
+        with st.form("bootstrap"):
+            st.subheader("Create the first administrator")
+            st.caption(
+                "No accounts exist yet, so this one gets every permission. Add "
+                "viewers and analysts afterwards under **Manage accounts**. "
+                f"Passwords are stored as PBKDF2-HMAC-SHA256 "
+                f"({settings.auth_pbkdf2_iterations // 1000}k iterations) with a "
+                f"per-user salt in `auth/users.db`; nothing leaves this machine."
+            )
+            username = st.text_input("Username", value="admin")
+            password = st.text_input(
+                "Password", type="password",
+                help=f"At least {settings.auth_min_password_length} characters.",
+            )
+            repeat = st.text_input("Repeat password", type="password")
+            if st.form_submit_button("Create account", type="primary"):
+                if password != repeat:
+                    st.error("The two passwords do not match.")
+                else:
+                    try:
+                        st.session_state["user"] = store.create_user(
+                            username, password, Role.ADMIN.value
+                        )
+                        st.rerun()
+                    except AuthError as exc:
+                        st.error(str(exc))
+    else:
+        with st.form("login"):
+            st.subheader("Sign in")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            if st.form_submit_button("Sign in", type="primary"):
+                account = store.authenticate(username, password)
+                if account:
+                    st.session_state["user"] = account
+                    st.rerun()
+                else:
+                    st.error(
+                        "Sign-in failed. Accounts lock for "
+                        f"{settings.auth_lockout_minutes} minutes after "
+                        f"{settings.auth_max_failed_attempts} failed attempts."
+                    )
+    st.stop()
+
+
+def render_account_panel(user: dict) -> None:
+    """Who is signed in, what that role may do, and (for administrators)
+    account management."""
+    from auth import PERMISSIONS, AuthError, Role, can, get_user_store
+
+    store = get_user_store()
+    role = user["role"]
+
+    with st.sidebar:
+        st.divider()
+        st.subheader("👤 Account")
+        st.markdown(f"**{user['username']}** · `{role}`")
+        st.caption("Can do: " + ", ".join(sorted(PERMISSIONS[Role(role)])))
+        if st.button("Sign out", use_container_width=True):
+            st.session_state.pop("user", None)
+            st.rerun()
+
+        if not can(role, "manage_users"):
+            return
+
+        with st.expander("Manage accounts"):
+            st.markdown("**Add account**")
+            new_name = st.text_input("Username", key="new_account_name")
+            new_role = st.selectbox(
+                "Role", [r.value for r in Role], key="new_account_role",
+                help="viewer: ask questions. analyst: also ingest sources. "
+                     "admin: also delete sources, export history, manage accounts.",
+            )
+            new_pw = st.text_input("Password", type="password", key="new_account_pw")
+            new_pw2 = st.text_input("Repeat password", type="password", key="new_account_pw2")
+            if st.button("Create account", key="create_account"):
+                if new_pw != new_pw2:
+                    st.error("The two passwords do not match.")
+                else:
+                    try:
+                        store.create_user(new_name, new_pw, new_role)
+                        st.success(f"Created {new_role} account '{new_name}'.")
+                        st.rerun()
+                    except AuthError as exc:
+                        st.error(str(exc))
+
+            st.markdown("**Existing accounts**")
+            users = store.list_users()
+            for account in users:
+                st.caption(
+                    f"`{account['username']}` · {account['role']} · "
+                    f"created {account['created_at'][:10]} · "
+                    f"last login {account['last_login_at'][:16] if account['last_login_at'] else 'never'}"
+                )
+            names = [account["username"] for account in users]
+            if not names:
+                return
+            target = st.selectbox("Account", names, key="account_target")
+            target_role = st.selectbox(
+                "Role", [r.value for r in Role],
+                index=[r.value for r in Role].index(
+                    next(a["role"] for a in users if a["username"] == target)
+                ),
+                key="account_target_role",
+            )
+            if st.button("Update role", key="update_role"):
+                try:
+                    store.set_role(target, target_role)
+                    st.success(f"'{target}' is now a {target_role}.")
+                    if target == user["username"]:
+                        st.session_state["user"] = {"username": target, "role": target_role}
+                    st.rerun()
+                except AuthError as exc:
+                    st.error(str(exc))
+
+            reset_pw = st.text_input("New password", type="password", key="reset_pw")
+            if st.button("Reset password", key="reset_pw_button"):
+                try:
+                    store.set_password(target, reset_pw)
+                    st.success(f"Password updated for '{target}'.")
+                except AuthError as exc:
+                    st.error(str(exc))
+
+            if st.button("Delete account", key="delete_account"):
+                if target == user["username"]:
+                    st.error("You cannot delete the account you are signed in with.")
+                else:
+                    try:
+                        store.delete_user(target)
+                        st.success(f"Deleted '{target}'.")
+                        st.rerun()
+                    except AuthError as exc:
+                        st.error(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Chat history
+# ---------------------------------------------------------------------------
+
+NEW_SESSION_LABEL = "＋ New session"
+
+
+def render_session_sidebar(backend) -> None:
+    """Session picker, exports and delete. Sessions are created on the first
+    saved answer rather than on load, so browsing never litters the list with
+    empty conversations."""
+    from chat_history import get_history
+
+    history = get_history()
+    sessions = history.list_sessions(limit=100)
+
+    with st.sidebar:
+        st.divider()
+        st.subheader("💬 History")
+        if not sessions:
+            st.caption("No saved sessions yet. Ask a question and it is saved here.")
+            st.session_state["active_session"] = None
+            return
+
+        labels = [NEW_SESSION_LABEL] + [
+            f"{session['title']}  ·  {session['message_count']} msg"
+            for session in sessions
+        ]
+        active = st.session_state.get("active_session")
+        index = 0
+        if active:
+            for position, session in enumerate(sessions, start=1):
+                if session["session_id"] == active:
+                    index = position
+                    break
+
+        choice = st.selectbox(
+            "Session", labels, index=index,
+            key="history_session_picker", label_visibility="collapsed",
+        )
+        st.session_state["active_session"] = (
+            None if choice == NEW_SESSION_LABEL else sessions[index - 1]["session_id"]
+        )
+        current = st.session_state["active_session"]
+
+        if current:
+            from auth import can
+
+            # Export hands a whole session to a reviewer, so it is an admin
+            # permission. Deleting your own session is not.
+            if can(current_user()["role"], "export_history"):
+                left, right = st.columns(2)
+                left.download_button(
+                    "⬇ Markdown", history.export_markdown(current),
+                    file_name=f"evidence_session_{current[:8]}.md",
+                    mime="text/markdown", use_container_width=True,
+                )
+                right.download_button(
+                    "⬇ CSV", history.export_csv(current),
+                    file_name=f"evidence_session_{current[:8]}.csv",
+                    mime="text/csv", use_container_width=True,
+                )
+            else:
+                st.caption("Exporting a session needs the admin role.")
+            if st.button("🗑 Delete session", use_container_width=True):
+                history.delete_session(current)
+                st.session_state["active_session"] = None
+                st.rerun()
+
+        stats = history.stats()
+        st.caption(
+            f"{stats['sessions']} session(s) · {stats['messages']} message(s) · "
+            f"{stats['answers_with_unverified_figures']} answer(s) carried "
+            f"unverified figures"
+        )
+
+
+def render_history_message(message: dict) -> None:
+    """Replay one saved answer from its stored trace alone.
+
+    Nothing here touches the index, so a session stays inspectable after the
+    corpus is rebuilt or a source is removed -- which is the point of storing
+    the trace.
+    """
+    if message["abstained"]:
+        st.warning(
+            f"**Abstained** (`{message['error_code'] or 'insufficient_evidence'}`)"
+        )
+    elif message["unverified"]:
+        st.warning(
+            "Partially grounded — unverified figure(s): "
+            + ", ".join(message["unverified"])
+        )
+    st.markdown(message["content"])
+
+    if message["confidence"] is not None:
+        st.caption(
+            f"Confidence {message['confidence']:.2f} · saved {message['created_at']}"
+        )
+
+    if message["citations"]:
+        st.markdown("**Citations**")
+        for citation in message["citations"]:
+            where = citation.get("location") or ""
+            st.markdown(
+                f"- **Citation {citation['citation_id']}** — `{citation['filename']}` · "
+                f"{citation['modality']}" + (f" · {where}" if where else "")
+            )
+
+    trace = message["trace"] or {}
+    evidence = trace.get("evidence", [])
+    if evidence:
+        with st.expander(f"Evidence retrieved ({len(evidence)})"):
+            st.table([
+                {
+                    "#": item["rank"],
+                    "source": item["filename"],
+                    "modality": item["modality"],
+                    "location": item.get("location") or "-",
+                    "retrieval": item["retrieval_score"],
+                    "rerank": item["rerank_score"],
+                }
+                for item in evidence
+            ])
+            for item in evidence:
+                notes = []
+                if item.get("speaker"):
+                    notes.append(f"speaker: {item['speaker']}")
+                if item.get("ocr_confidence") is not None:
+                    notes.append(f"OCR confidence: {item['ocr_confidence']:.0f}%")
+                if item.get("ocr_unreliable"):
+                    notes.append("OCR unreliable — figures may be misread")
+                if notes:
+                    st.caption(f"#{item['rank']} `{item['filename']}` — " + " · ".join(notes))
+                if item.get("excerpt"):
+                    st.code(item["excerpt"][:400])
+
+    if trace.get("representation"):
+        with st.expander("Query representation used for retrieval"):
+            st.code(trace["representation"][:2000])
+
+    timings = message["timings"] or {}
+    if timings:
+        with st.expander("Stage timings"):
+            for stage, value in timings.items():
+                st.caption(f"{stage}: {value:.0f} ms")
+
+
+def render_session_turns() -> None:
+    """The active session's turns, above the question box."""
+    from chat_history import get_history
+
+    session_id = st.session_state.get("active_session")
+    if not session_id:
+        return
+    messages = get_history().messages(session_id)
+    if not messages:
+        return
+
+    st.subheader("This session")
+    for message in messages:
+        if message["role"] == "user":
+            st.markdown(f"**Q:** {message['content']}")
+            continue
+        summary = " ".join(message["content"].split())
+        if len(summary) > 110:
+            summary = summary[:110] + "…"
+        prefix = "🚫 " if message["abstained"] else ("⚠️ " if message["unverified"] else "")
+        with st.expander(f"{prefix}A: {summary}"):
+            render_history_message(message)
+
+
+def save_turn(pipeline, request, response, backend) -> None:
+    """Persist one question/answer pair with its full audit trace."""
+    from chat_history import build_trace, get_history
+    from numeric_guard import last_guard_detail
+
+    history = get_history()
+    session_id = st.session_state.get("active_session")
+    if not session_id:
+        session_id = history.create_session(
+            backend=getattr(backend, "value", str(backend))
+        )
+        st.session_state["active_session"] = session_id
+
+    history.add_user_message(session_id, request.query)
+    flagged, _searched = last_guard_detail()
+    history.add_assistant_message(
+        session_id,
+        response,
+        trace=build_trace(
+            request, response, pipeline.filenames_for(response.retrieved_items)
+        ),
+        unverified=flagged,
+    )
+
+
 def main() -> None:
     from providers import Backend
+
+    user = render_login()
 
     st.title("🔍 Evidence AI")
     st.caption(
@@ -258,6 +649,8 @@ def main() -> None:
     pipeline = load_pipeline()
     backend_ready = render_backend_status(pipeline, backend)
     render_health(pipeline, backend)
+    render_session_sidebar(backend)
+    render_account_panel(user)
 
     if backend is Backend.OFFLINE:
         st.caption("🔒 Offline mode — every stage runs on this machine.")
@@ -273,37 +666,54 @@ def main() -> None:
 
     # ---------------------------------------------------------------- ingest
     with tab_ingest:
-        st.subheader("Add sources to the index")
-        st.caption(
-            "Upload each source **once**. It is processed into indexed items "
-            "that persist across restarts, so you can then ask any number of "
-            "questions in the **Ask** tab without uploading it again."
-        )
-        uploads = st.file_uploader(
-            "PDF, DOC, DOCX, TXT, CSV, PNG, JPG, WEBP, WAV, MP3, M4A",
-            type=["pdf", "doc", "docx", "txt", "csv", "png", "jpg", "jpeg",
-                  "webp", "wav", "mp3", "m4a"],
-            accept_multiple_files=True,
-        )
-        if uploads and st.button("Ingest files", type="primary"):
-            for upload in uploads:
-                with st.spinner(f"Processing {upload.name}..."):
-                    path = pipeline.store_upload(upload.name, upload.getvalue())
-                    result = pipeline.ingest_file(str(path))
-                if result.success:
-                    st.success(
-                        f"{result.source.filename} — {len(result.items)} items, "
-                        f"{len(result.relationships)} relationships"
-                    )
-                else:
-                    st.error(
-                        f"{result.source.filename} — "
-                        f"{result.error_code.value if result.error_code else 'FAILED'}: "
-                        f"{result.error}"
-                    )
-                for warning in result.warnings:
-                    st.warning(warning)
-            st.cache_resource.clear()
+        from auth import can
+
+        if not can(user["role"], "ingest"):
+            st.error(
+                f"Your role (`{user['role']}`) can ask questions but not add "
+                "sources. An analyst or administrator can ingest files for you."
+            )
+        else:
+            st.subheader("Add sources to the index")
+            st.caption(
+                "Upload each source **once**. It is processed into indexed items "
+                "that persist across restarts, so you can then ask any number of "
+                "questions in the **Ask** tab without uploading it again."
+            )
+            collection = st.text_input(
+                "Collection",
+                value=st.session_state.get("ingest_collection", "general"),
+                help="Logical grouping for these sources (e.g. contracts-2026). "
+                     "Search can be scoped to one collection in the Ask tab.",
+            ).strip() or "general"
+            st.session_state["ingest_collection"] = collection
+
+            uploads = st.file_uploader(
+                "PDF, DOC, DOCX, TXT, CSV, PNG, JPG, WEBP, WAV, MP3, M4A",
+                type=["pdf", "doc", "docx", "txt", "csv", "png", "jpg", "jpeg",
+                      "webp", "wav", "mp3", "m4a"],
+                accept_multiple_files=True,
+            )
+            if uploads and st.button("Ingest files", type="primary"):
+                for upload in uploads:
+                    with st.spinner(f"Processing {upload.name}..."):
+                        path = pipeline.store_upload(upload.name, upload.getvalue())
+                        result = pipeline.ingest_file(str(path), collection=collection)
+                    if result.success:
+                        st.success(
+                            f"{result.source.filename} — {len(result.items)} items, "
+                            f"{len(result.relationships)} relationships "
+                            f"(collection: {result.source.collection})"
+                        )
+                    else:
+                        st.error(
+                            f"{result.source.filename} — "
+                            f"{result.error_code.value if result.error_code else 'FAILED'}: "
+                            f"{result.error}"
+                        )
+                    for warning in result.warnings:
+                        st.warning(warning)
+                st.cache_resource.clear()
 
     # ----------------------------------------------------------------- query
     with tab_query:
@@ -320,6 +730,8 @@ def main() -> None:
             f"{stats['sources']} source(s). Ingested sources stay indexed — "
             "you never need to upload them again to ask about them."
         )
+
+        render_session_turns()
 
         mode = st.radio(
             "How do you want to ask?",
@@ -371,6 +783,22 @@ def main() -> None:
             "Question", value=default_question, height=80, placeholder=placeholder,
         )
 
+        collections = pipeline.store.list_collections()
+        scope_options = ["All collections"] + [
+            f"{entry['collection']} ({entry['sources']})" for entry in collections
+        ]
+        scope_label = st.selectbox(
+            "Search scope",
+            scope_options,
+            index=0,
+            help="Restrict retrieval to one collection. Sources are grouped at "
+                 "ingest time in the Ingest tab.",
+        )
+        scope = (
+            None if scope_label == "All collections"
+            else scope_label.rsplit(" (", 1)[0]
+        )
+
         col_a, col_b, col_c = st.columns(3)
         top_k = col_a.slider("Retrieve (top_k)", 1, 50, settings.top_k)
         rerank_top_k = col_b.slider("Rerank to", 1, 20, settings.rerank_top_k)
@@ -408,11 +836,32 @@ def main() -> None:
                                 else InferenceMode.LOCAL),
                 query_modality=modality,
                 query_file_path=temp_path,
+                collection=scope,
             )
             from rag_pipeline import last_technical_detail
 
-            with st.spinner("Retrieving, reranking, generating..."):
-                response = pipeline.query(request, backend=backend)
+            if settings.streaming_enabled:
+                # Tokens render as they arrive; the finished QueryResponse is
+                # the last object the generator yields.
+                placeholder = st.empty()
+                placeholder.markdown("_Retrieving and reranking evidence..._")
+                buffer = ""
+                response = None
+                for chunk in pipeline.query_stream(request, backend=backend):
+                    if isinstance(chunk, QueryResponse):
+                        response = chunk
+                    else:
+                        buffer += chunk
+                        placeholder.markdown(buffer)
+                placeholder.empty()
+                if response is None:
+                    response = QueryResponse(
+                        answer="The answer stream ended unexpectedly.",
+                        abstained=True,
+                    )
+            else:
+                with st.spinner("Retrieving, reranking, generating..."):
+                    response = pipeline.query(request, backend=backend)
             technical = last_technical_detail()
             if temp_path:
                 Path(temp_path).unlink(missing_ok=True)
@@ -425,19 +874,52 @@ def main() -> None:
                 with st.expander("Query representation used for retrieval"):
                     st.code(response.query_representation[:2000])
 
+            save_turn(pipeline, request, response, backend)
             render_response(pipeline, response)
 
     # --------------------------------------------------------------- sources
     with tab_sources:
-        sources = pipeline.store.list_sources()
+        present = pipeline.store.list_collections()
+        if len(present) > 1:
+            wanted = st.selectbox(
+                "Collection",
+                ["All"] + [entry["collection"] for entry in present],
+                key="sources_collection_filter",
+            )
+        else:
+            wanted = "All"
+        sources = pipeline.store.list_sources(
+            None if wanted == "All" else wanted
+        )
         if not sources:
             st.info("Nothing indexed yet. Use the Ingest tab.")
         for source in sources:
-            with st.expander(f"{source.filename}  ·  {source.source_type.value}"):
+            with st.expander(
+                f"{source.filename}  ·  {source.source_type.value}  ·  "
+                f"{source.collection}"
+            ):
                 st.caption(
                     f"source_id `{source.source_id}` · "
                     f"{(source.file_size or 0) / 1024:.0f} KB · {source.file_path}"
                 )
+                from auth import can
+
+                if can(user["role"], "delete"):
+                    if st.button(
+                        "Delete from index", key=f"delete_{source.source_id}",
+                        help="Removes this source and its items from the index. "
+                             "The original file on disk and any saved chat "
+                             "history are left untouched.",
+                    ):
+                        removed = pipeline.delete_source(source.source_id)
+                        st.cache_resource.clear()
+                        st.warning(
+                            f"Deleted {source.filename} ({removed} item(s)). "
+                            "The file itself is still on disk."
+                        )
+                        st.rerun()
+                else:
+                    st.caption("Deleting a source needs the admin role.")
                 items = pipeline.store.get_items_by_source(source.source_id)
                 st.write(f"{len(items)} indexed items")
                 for item in items[:20]:

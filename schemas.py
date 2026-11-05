@@ -122,6 +122,10 @@ class Source(BaseModel):
     file_path: str
     mime_type: str | None = None
     file_size: int | None = None
+    # Logical grouping ("contracts-2026", "board-meetings", ...). One index
+    # holds every collection; search can be scoped to one. Default keeps
+    # existing callers and stored rows valid.
+    collection: str = "general"
 
 
 class SourceLocation(BaseModel):
@@ -136,14 +140,22 @@ class SourceLocation(BaseModel):
     image_path: str | None = None
 
     def human(self) -> str:
-        """Render the location the way a citation should show it."""
+        """Render the location the way a citation should show it.
+
+        Parts are combined rather than ranked: "Page 4 - Risks and Outlook" says
+        more than either half, and the section is what tells a reader why one
+        page-4 chunk was chosen over another. This string also heads the evidence
+        block the model reads, so it is where a chunk's heading path reaches
+        generation.
+        """
+        parts: list[str] = []
         if self.page_number is not None:
-            return f"Page {self.page_number}"
+            parts.append(f"Page {self.page_number}")
         if self.timestamp_start is not None and self.timestamp_end is not None:
-            return f"{clock(self.timestamp_start)}-{clock(self.timestamp_end)}"
+            parts.append(f"{clock(self.timestamp_start)}-{clock(self.timestamp_end)}")
         if self.section:
-            return self.section
-        return ""
+            parts.append(self.section)
+        return " - ".join(parts)
 
 
 class ContentItem(BaseModel):
@@ -212,6 +224,9 @@ class QueryRequest(BaseModel):
     inference_mode: InferenceMode = InferenceMode.LOCAL
     query_modality: QueryModality = QueryModality.TEXT
     query_file_path: str | None = None
+    # None searches every collection; a name scopes retrieval to that
+    # collection only.
+    collection: str | None = None
 
 
 class QueryResponse(BaseModel):

@@ -1,0 +1,9 @@
+{
+  "id": "Q7-multihop-budget",
+  "expected_sources": [
+    "project_metrics.csv",
+    "project_notes.docx",
+    "project_report.pdf"
+  ],
+  "expected_modality": "text"
+}

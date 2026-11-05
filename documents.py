@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 
 from config import settings
+from ocr import OcrResult
 from schemas import (
     ContentItem,
     ErrorCode,
@@ -53,13 +54,56 @@ MIN_PAGE_CHARS_BEFORE_OCR = 80
 # Chunking
 # ---------------------------------------------------------------------------
 
+def chunk_blocks(
+    text: str,
+    base_heading: tuple[str, ...] | str = (),
+    chunk_size: int | None = None,
+    overlap: int | None = None,
+) -> list:
+    """Split text into Chunk objects, honouring settings.chunking_mode.
+
+    Callers use this rather than chunk_text when they want the heading path each
+    chunk was found under, which becomes the citation's section. In "fixed" mode
+    the chunks come back with an empty path, so the call sites do not branch.
+    """
+    if settings.chunking_mode.strip().lower() == "structure":
+        from chunking import split_document
+
+        return split_document(
+            text, max_chars=chunk_size, overlap=overlap, base_heading=base_heading
+        )
+
+    from chunking import Chunk
+
+    return [
+        Chunk(piece, tuple([base_heading] if isinstance(base_heading, str)
+                           else base_heading))
+        for piece in chunk_text(text, chunk_size, overlap)
+    ]
+
+
 def chunk_text(
     text: str,
     chunk_size: int | None = None,
     overlap: int | None = None,
 ) -> list[str]:
-    """Split on a character window with overlap, preferring to break at a
-    sentence or whitespace boundary so chunks stay readable as citations."""
+    """Split text into strings, honouring settings.chunking_mode."""
+    if settings.chunking_mode.strip().lower() == "structure":
+        from chunking import chunk_strings
+
+        return chunk_strings(text, max_chars=chunk_size, overlap=overlap)
+    return _chunk_fixed(text, chunk_size, overlap)
+
+
+def _chunk_fixed(
+    text: str,
+    chunk_size: int | None = None,
+    overlap: int | None = None,
+) -> list[str]:
+    """The character-window splitter: split on a window with overlap, preferring
+    to break at a sentence or whitespace boundary so chunks stay readable as
+    citations. Kept because it is the fallback for text with no structure at all
+    and because a chunking change should be reversible from .env."""
     size = chunk_size or settings.chunk_size
     over = overlap if overlap is not None else settings.chunk_overlap
     text = " ".join(text.split())
@@ -148,40 +192,55 @@ def _extract_pdf(path: Path, warnings: list[str]) -> list[Extracted]:
         for page_index, page in enumerate(doc, start=1):
             text = page.get_text("text").strip()
             ocr_used = False
+            ocr_confidence: float | None = None
 
             if len(text) < MIN_PAGE_CHARS_BEFORE_OCR:
-                ocr_text = _ocr_pdf_page(page, warnings, page_index)
-                if len(ocr_text) > len(text):
-                    text, ocr_used = ocr_text, True
+                ocr = _ocr_pdf_page(page, warnings, page_index)
+                if len(ocr.text) > len(text):
+                    from ocr import annotate
+
+                    text = annotate(ocr.text, ocr)
+                    ocr_used = True
+                    ocr_confidence = round(ocr.confidence, 1)
 
             if not text:
                 continue
-            for chunk in chunk_text(text):
+            for chunk in chunk_blocks(text):
                 out.append((
-                    chunk,
-                    SourceLocation(page_number=page_index),
-                    {"ocr_used": ocr_used},
+                    chunk.text,
+                    SourceLocation(
+                        page_number=page_index,
+                        section=chunk.section or None,
+                    ),
+                    {
+                        "ocr_used": ocr_used,
+                        "ocr_confidence": ocr_confidence,
+                        **chunk.metadata(),
+                    },
                 ))
     return out
 
 
-def _ocr_pdf_page(page, warnings: list[str], page_index: int) -> str:
-    """Rasterise one PDF page and OCR it. Returns '' on any failure -- a
-    scanned page we cannot read is skipped, never fabricated."""
+def _ocr_pdf_page(page, warnings: list[str], page_index: int) -> OcrResult:
+    """Rasterise one PDF page and OCR it. Returns an empty result on any
+    failure -- a scanned page we cannot read is skipped, never fabricated."""
     try:
         import io
 
-        import pytesseract
         from PIL import Image
 
-        pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+        from ocr import ocr_with_confidence, warning_for
+
         pixmap = page.get_pixmap(dpi=200)
         image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-        return pytesseract.image_to_string(image).strip()
+        result = ocr_with_confidence(image)
+        if result.unreliable:
+            warnings.append(f"Page {page_index}: {warning_for(result)}")
+        return result
     except Exception as exc:
         warnings.append(f"OCR failed on page {page_index}: {exc}")
         logger.warning("PDF OCR failed on page %s: %s", page_index, exc)
-        return ""
+        return OcrResult()
 
 
 def _extract_docx(path: Path, warnings: list[str]) -> list[Extracted]:
@@ -198,9 +257,16 @@ def _extract_docx(path: Path, warnings: list[str]) -> list[Extracted]:
     def flush() -> None:
         if not buffer:
             return
-        joined = " ".join(buffer)
-        for chunk in chunk_text(joined):
-            out.append((chunk, SourceLocation(section=current_section), {}))
+        # Blank-line separated, not space separated: python-docx hands over one
+        # paragraph per entry, and the splitter needs those boundaries to keep a
+        # paragraph whole instead of packing by character count.
+        joined = "\n\n".join(buffer)
+        for chunk in chunk_blocks(joined, base_heading=current_section):
+            out.append((
+                chunk.text,
+                SourceLocation(section=chunk.section or current_section),
+                dict(chunk.metadata()),
+            ))
         buffer.clear()
 
     for para in document.paragraphs:
@@ -222,12 +288,20 @@ def _extract_docx(path: Path, warnings: list[str]) -> list[Extracted]:
                 rows.append(" | ".join(cells))
         if not rows:
             continue
-        table_text = f"Table {table_index}: " + "; ".join(rows)
-        for chunk in chunk_text(table_text):
+        # Structure mode gets one row per line so the splitter can see the header
+        # row and repeat it onto every chunk of the table: "99.0" on its own is
+        # not evidence. Fixed mode keeps the original single-line form, which is
+        # what the published baseline measured.
+        if settings.chunking_mode.strip().lower() == "structure":
+            table_text = "\n".join(rows)
+        else:
+            table_text = f"Table {table_index}: " + "; ".join(rows)
+        for chunk in chunk_blocks(table_text, base_heading=f"Table {table_index}"):
             out.append((
-                chunk,
-                SourceLocation(section=f"Table {table_index}"),
-                {"is_table": True},
+                chunk.text,
+                SourceLocation(section=chunk.section or f"Table {table_index}"),
+                {"is_table": True, **{k: v for k, v in chunk.metadata().items()
+                                      if k != "is_table"}},
             ))
     return out
 
@@ -270,17 +344,34 @@ def _convert_doc_to_docx(path: Path) -> Path:
 
 def _extract_txt(path: Path, warnings: list[str]) -> list[Extracted]:
     text = path.read_text(encoding="utf-8", errors="replace")
-    return [(chunk, SourceLocation(), {}) for chunk in chunk_text(text)]
+    return [
+        (
+            chunk.text,
+            SourceLocation(section=chunk.section or None),
+            dict(chunk.metadata()),
+        )
+        for chunk in chunk_blocks(text)
+    ]
 
 
 def _extract_csv(path: Path, warnings: list[str]) -> list[Extracted]:
-    """Each row becomes one searchable 'column: value' sentence, which
-    embeds far better than a raw comma-separated line."""
+    """Each row becomes a self-describing 'column: value' sentence, which embeds
+    far better than a raw comma-separated line -- then rows are packed into
+    chunks by the same structure-aware splitter every other format uses.
+
+    Packing matters more than it looks. One item per row means a four-row table
+    is four items, and retrieval caps how many items a single source may
+    contribute (mmr_max_per_source). With that cap at two, the model can never
+    see all four rows, so "which quarter is highest" is unanswerable no matter
+    how good the ranking is: the row holding the answer is filtered out as a
+    duplicate source. A small table now arrives whole; a large one still splits,
+    at the chunk cap instead of at every row.
+    """
     import pandas as pd
 
     frame = pd.read_csv(path)
     columns = [str(c) for c in frame.columns]
-    out: list[Extracted] = []
+    rows: list[tuple[int, str]] = []
     for row_index, row in frame.iterrows():
         parts = [
             f"{col}: {row[col]}"
@@ -289,11 +380,41 @@ def _extract_csv(path: Path, warnings: list[str]) -> list[Extracted]:
         ]
         if not parts:
             continue
-        text = f"Row {int(row_index) + 1} -- " + "; ".join(parts)
+        rows.append((int(row_index), f"Row {int(row_index) + 1} -- " + "; ".join(parts)))
+
+    if not rows:
+        return []
+
+    if settings.chunking_mode.strip().lower() != "structure":
+        # Fixed mode keeps the original one-item-per-row contract. Row packing is
+        # a structure-mode improvement and is not applied here, because the
+        # published evaluation baseline (evaluation/baseline.json) was measured
+        # against one item per row and evaluation.py --compare fails any build
+        # that silently changes it.
+        return [
+            (text, SourceLocation(section=f"Row {index + 1}"), {"row_index": index})
+            for index, text in rows
+        ]
+
+    out: list[Extracted] = []
+    for chunk in chunk_blocks("\n".join(text for _, text in rows)):
+        # Which rows landed in this chunk, so the citation can still say
+        # "Rows 1-4" and the metadata keeps the original row indices.
+        numbers = [
+            index + 1 for index, text in rows
+            if f"Row {index + 1} --" in chunk.text
+        ]
+        if len(numbers) == 1:
+            section = f"Row {numbers[0]}"
+        elif numbers:
+            section = f"Rows {numbers[0]}-{numbers[-1]}"
+        else:
+            section = chunk.section or "Table"
         out.append((
-            text,
-            SourceLocation(section=f"Row {int(row_index) + 1}"),
-            {"row_index": int(row_index)},
+            chunk.text,
+            SourceLocation(section=section),
+            {"row_indices": [n - 1 for n in numbers], "row_count": len(numbers),
+             **{k: v for k, v in chunk.metadata().items() if k != "is_table"}},
         ))
     return out
 
@@ -330,6 +451,11 @@ def process_document(path_str: str) -> IngestionResult:
             raise ValueError(f"{ErrorCode.UNSUPPORTED_FILE_TYPE.value}: {working_type}")
 
         extracted = extractor(working_path, warnings)
+        if settings.chunking_mode.strip().lower() == "structure":
+            # Furniture only becomes its own chunk under structure-aware
+            # chunking; in fixed mode those lines sit inside page-sized chunks
+            # and there is nothing to remove.
+            extracted = _dedupe(extracted, warnings)
         if not extracted:
             return IngestionResult(
                 source=source,
@@ -366,6 +492,37 @@ def process_document(path_str: str) -> IngestionResult:
     except Exception as exc:
         logger.error("process_document failed for %s: %s", path_str, exc)
         return _failure(path_str, source, exc, warnings)
+
+
+def _dedupe(extracted: list[Extracted], warnings: list[str]) -> list[Extracted]:
+    """Drop repeated page furniture: heading-only chunks whose text already
+    appeared in this document.
+
+    Running heads, footers and watermarks are extracted from every page, so one
+    banner line becomes one junk item per page. Structure-aware chunking makes
+    them visible -- a furniture line is a heading with no body under it, and it
+    now surfaces as its own chunk instead of hiding inside a page of prose -- so
+    they can be removed precisely. Only chunks flagged `heading_only` are
+    candidates: a body paragraph that genuinely repeats (a refrain, a restated
+    figure) is evidence and is kept.
+    """
+    seen: set[str] = set()
+    kept: list[Extracted] = []
+    dropped = 0
+    for text, location, extra in extracted:
+        key = " ".join(text.split())
+        if extra.get("heading_only") and key and key in seen:
+            dropped += 1
+            continue
+        if key:
+            seen.add(key)
+        kept.append((text, location, extra))
+    if dropped:
+        warnings.append(
+            f"Dropped {dropped} repeated heading/furniture line(s) identical to "
+            "an earlier one (running head, footer or watermark)."
+        )
+    return kept
 
 
 def build_document_relationships(items: list[ContentItem]) -> list[Relationship]:

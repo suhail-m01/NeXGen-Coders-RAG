@@ -197,6 +197,23 @@ It blocks every non-loopback socket and DNS lookup, then answers a question. `PA
 
 ## 5. Using it
 
+**Sign in** — the UI is gated. On first run there are no accounts, so it offers to create the **first administrator** (no default password is shipped, on purpose). Accounts live in `auth\users.db` as PBKDF2-HMAC-SHA256 hashes with a per-user salt; five failed attempts lock an account for five minutes.
+
+Three roles:
+
+| Role | Ask | Ingest | Delete source | Export session | Manage accounts |
+|---|---|---|---|---|---|
+| `viewer` | ✓ | — | — | — | — |
+| `analyst` | ✓ | ✓ | — | — | — |
+| `admin` | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Administrators get **Manage accounts** in the sidebar (add accounts, change roles, reset passwords, delete accounts — you cannot delete the one you are signed in with). Accounts can also be managed headlessly:
+```powershell
+.\.venv\Scripts\python scripts\create_user.py --username reviewer --role viewer
+.\.venv\Scripts\python scripts\create_user.py --list
+.\.venv\Scripts\python scripts\create_user.py --username reviewer --set-password
+```
+
 **Ask a question** — UI → *Ask* tab. Every answer lists citations with the exact page number (documents), timestamp range (audio) or OCR region (images). If evidence is too weak, it **abstains** instead of guessing, and says so.
 
 **Add your own files** — three ways:
@@ -207,6 +224,31 @@ It blocks every non-loopback socket and DNS lookup, then answers a question. `PA
 Supported: PDF, DOCX, `.doc` (needs LibreOffice), CSV/XLSX, PNG/JPG (OCR + optional vision), WAV/MP3/M4A/FLAC/OGG (Whisper with timestamps). Limit: 200 MB per file (`MAX_FILE_BYTES` in `.env`).
 
 Re-ingesting is safe — `source_id` is a content hash and existing item IDs are skipped, so nothing duplicates. `scripts\ingest_demo.py` goes further and skips an already-indexed file **before** extracting it, which matters because extraction is the expensive stage: without that, re-running would make Whisper re-transcribe every recording for nothing. Add `--force` when you genuinely want re-extraction (after changing an extractor or swapping a model).
+
+**Group sources into collections** — the *Ingest* tab has a **Collection** field (default `general`); on the CLI use `--collection`:
+```powershell
+.\.venv\Scripts\python scripts\ingest_demo.py --dir "D:\contracts" --collection contracts-2026
+```
+The *Ask* tab then has a **Search scope** dropdown. Scoping is applied inside retrieval (both the dense and the BM25 leg), so a scoped search never leaks evidence from another collection. All collections still live in one index — an index built before collections existed is migrated automatically on first open, with every existing source filed under `general`.
+
+**Review a past session** — the sidebar **💬 History** panel lists saved sessions. Every question and answer is stored in `history\chat_history.db` (deliberately outside `index\`, so rebuilding the index never destroys a conversation). Each saved answer keeps its full audit trail: the evidence ranks, both scores, filenames, locations, excerpts, speaker labels, OCR confidence, citations, stage timings and any figure the numeric guard could not verify. Expanding a past answer replays all of it **from the stored snapshot**, without re-running the query and without needing the source to still be indexed. **⬇ Markdown** and **⬇ CSV** export a session for a reviewer.
+
+**Guardrails you will see** — three of them, all before or after the model rather than inside it:
+- *Abstention gate* — weak evidence is refused before the LLM is called (image evidence is judged on its own threshold, `ABSTENTION_THRESHOLD_IMAGE`).
+- *Coverage guard* — refuses when a year the question commits to appears nowhere in the evidence.
+- *Numeric guard* — after generation, any figure absent from the evidence gets a visible `Evidence warning:` line naming it and the sources searched. It never deletes an answer; the UI badge downgrades "Grounded answer" to "Partially grounded".
+
+**OCR you can trust-check** — images and scanned PDF pages are OCR'd with per-word confidence. Weak words are dropped, digits are held to a higher bar than prose, small screenshots are upscaled first, and an unreliable passage is annotated in the evidence itself so the model is told a missing figure means *not legible*, never *not present*. The *Sources* and evidence panels show the confidence, how many words were kept and how many numeric tokens were withheld.
+
+**Speaker labels in audio** — long recordings are diarized locally (MFCC + clustering); transcript segments carry `Speaker N` and the label is stored in item metadata. A clip too short to cluster is treated as one speaker rather than guessed at.
+
+**Delete a source** — *Sources* tab, inside a source's expander (admin role only). It removes the source, its items and every relationship touching them, and rebuilds the vector index so the remaining `vector_id`s stay correct. Two things are deliberately left alone: the original file on disk, and any chat-history traces that cited it — a deleted source can still be audited after the fact.
+
+**Score answers with an LLM judge (optional)**:
+```powershell
+.\.venv\Scripts\python evaluation.py --judge
+```
+This adds four advisory columns per query. Read `judge_consistency_rate` **first**: every binary question is asked twice with the option order swapped, and only counts when both replies pick the same statement. A model that always answers "A" disagrees with itself on everything, so its scores come back empty and the report prints `UNUSABLE at this model size`. Measured on `qwen2.5:0.5b`: consistency 0.0, verdict UNUSABLE — the judge arm needs a 3B+ local model to mean anything. The deterministic metrics (keyword coverage, number checks, retrieval set math) remain the score of record either way.
 
 **Go fully offline** — after Step 8 succeeds, disconnect the network. Ollama, embeddings, reranker and Whisper all read from local caches.
 
@@ -235,6 +277,15 @@ Reports (Markdown/CSV/JSON) are written to `evaluation\reports\`.
 | Port 8501 already in use | Another app | `.\start.ps1 -UiPort 8502` |
 | UI spinner never ends | Server died or model reloading | Refresh the browser; check the PowerShell window for errors |
 | “No index yet” warning | Nothing ingested | `.\.venv\Scripts\python scripts\ingest_demo.py` |
+| `module 'coverage' has no attribute 'types'` during audio ingestion | An old `coverage.py` in the project root shadows the PyPI package numba imports | The module is now `coverage_guard.py`. Delete or rename any leftover `coverage.py` |
+| Audio ingests but no `Speaker N` labels | Clip too short to cluster, or diarization off | Normal for short clips; check `DIARIZATION_ENABLED=true` and `DIARIZATION_MAX_SPEAKERS` |
+| Answer carries an `Evidence warning:` line | The numeric guard found a figure absent from the evidence | Read the cited passage; if the figure is right, the evidence text is likely OCR-damaged — check the OCR confidence shown in the evidence panel |
+| Image questions abstain even though the image is indexed | OCR could not read it reliably | The evidence panel shows confidence and withheld numeric tokens; use a vision-capable model (`qwen2.5vl:3b`) for that source |
+| History panel is empty after asking | Session saved to a different working directory | Sessions live in `history\chat_history.db` relative to the project root; start the app from the kit folder |
+| Forgot a password | No recovery by design — hashes are not reversible | `.\.venv\Scripts\python scripts\create_user.py --username NAME --set-password` |
+| "Sign-in failed" after several tries | Account locked | Wait `AUTH_LOCKOUT_MINUTES` (default 5), or reset the password with the command above, which clears the lock |
+| `judge_consistency_rate` is 0.0 or low | Model too small to judge | Expected below ~3B. The judge arm is advisory; the deterministic metrics are the score of record |
+| Deleted a source and want it back | Deletion only touches the index | The original file is still on disk — ingest it again |
 | Antivirus/SmartScreen blocks a file | Downloaded-file mark | `Get-ChildItem -Recurse \| Unblock-File` (Step 6) |
 | Setup crawls or files vanish | Folder inside OneDrive | Move the kit to `C:\EvidenceAI` and re-run |
 
@@ -242,7 +293,59 @@ Reports (Markdown/CSV/JSON) are written to `evaluation\reports\`.
 
 ## 7. What I changed vs. the original repository
 
-Original files are **unmodified**. The repository's own `setup.ps1` cannot complete on a fresh clone, for two reasons I verified by running it:
+**This kit modifies core files.** An earlier version of this guide said original files were unmodified; that was true of the packaging work but is no longer true of the kit, and the claim is corrected here rather than left standing.
+
+### Upgrade programme (what changed and why)
+
+Every item below is config-gated, so each can be switched off in `.env` without touching code.
+
+| Area | Change | New files |
+|---|---|---|
+| Retrieval | Dense + BM25 hybrid, fused by reciprocal rank fusion | `lexical.py` |
+| Reranking | Length normalisation (long chunks were winning on size, not relevance) | — |
+| Diversity | MMR re-selection with a per-source cap | `mmr.py` |
+| Audio | Local speaker diarization (MFCC + agglomerative clustering + silhouette) | `diarization.py` |
+| Abstention | Calibrated threshold tooling; separate threshold for OCR/image evidence | `scripts/calibrate_abstention.py` |
+| Grounding | Deterministic coverage guard (question years must appear in evidence) | `coverage_guard.py` |
+| Grounding | Post-generation numeric guard with a visible caveat | `numeric_guard.py` |
+| OCR | Per-word confidence, digit-specific threshold, adaptive upscaling, reliability annotation | `ocr.py` |
+| Generation | Token streaming through pipeline, providers and UI | — |
+| UX | Persistent chat sessions with full retrieval traces, replay and export | `chat_history.py` |
+| UX | Logical collections with scoped search | — |
+| Access control | Local accounts, three roles, PBKDF2 hashing, lockout, headless account CLI | `auth.py`, `scripts\create_user.py` |
+| Corpus management | `delete_source` with a safe index rebuild (positional FAISS ids make in-place removal unsafe) | — |
+| Evaluation | Optional LLM-judge arm with order-swap consistency checking | `llm_judge.py` |
+| Reproducibility | Fixed Ollama seed, so evaluation reports are comparable run to run | — |
+
+Modified upstream files (16, verified with `git status`): `.env.example`, `app.py`, `audio.py`, `config.py`, `documents.py`, `evaluation.py`, `images.py`, `llm.py`, `providers.py`, `rag_pipeline.py`, `requirements-lock.txt`, `requirements.txt`, `reranker.py`, `retriever.py`, `schemas.py`, `vector_store.py`.
+
+Added by this kit: `lexical.py`, `mmr.py`, `diarization.py`, `ocr.py`, `coverage_guard.py`, `numeric_guard.py`, `chat_history.py`, `auth.py`, `llm_judge.py`, `run_demo.py`, `setup_windows.ps1`, this guide, and everything under `scripts\` (`ingest_demo.py`, `smoke_test.py`, `verify_env.py`, `prepare_models.py`, `verify_offline.py`, `calibrate_abstention.py`, `create_user.py`).
+
+`api.py` accepts a `QueryRequest` directly, so it picked up collection scoping and the new response behaviour from `schemas.py` with no change to the contract.
+
+**The API is authenticated.** Every endpoint except `GET /health` requires a bearer token that resolves to one of the same local accounts the UI uses, and is checked against that account's role:
+
+```
+Authorization: Bearer eai_...
+```
+
+| Endpoint | Permission needed |
+| --- | --- |
+| `GET /health` | none (runtime status only) |
+| `POST /query`, `POST /query_file`, `GET /sources`, `GET /source/{id}`, `GET /source/{id}/file` | `ask` (viewer and above) |
+| `POST /ingest` | `ingest` (analyst and above) |
+| `POST /ingest` with `replace=true` | `ingest` **and** `delete` (admin) |
+| `DELETE /source/{id}` | `delete` (admin) |
+
+Mint, list and revoke tokens with `scripts\create_user.py --create-token | --list-tokens | --revoke-token`. The plaintext is shown once; only its SHA-256 digest is stored, and deleting an account kills its tokens immediately. A missing or revoked token is `401`; a valid token whose role is not allowed is `403`. `API_AUTH_ENABLED=false` turns the gate off — which leaves the API open on whatever interface it is bound to, so keep it on and keep the port on `127.0.0.1`.
+
+One rename worth knowing about: the coverage guard module is `coverage_guard.py`, **not** `coverage.py`. A bare `coverage.py` shadows the PyPI `coverage` package that numba imports, and numba is a librosa dependency — the collision broke the audio decode path with a confusing `module 'coverage' has no attribute 'types'`. If you keep any older copy of this kit, do not rename it back.
+
+Measured effect on the six-query evaluation set (CPU, `qwen2.5:0.5b`): 3 PASS / 3 CHECK became **5 PASS / 1 CHECK**; answer correctness 0.667 → 0.833; citation accuracy 0.381 → 0.631; groundedness 0.833 → **1.0**; hallucination rate 0.167 → **0.0**; abstention accuracy 0.667 → **1.0**. The one remaining CHECK (Q5, a broad cross-modal question) is the substitute model copying its top passage verbatim rather than synthesising — retrieval and citation for that query are correct.
+
+### The original packaging problems (still true)
+
+The repository's own `setup.ps1` cannot complete on a fresh clone, for two reasons I verified by running it:
 
 1. It calls `scripts\verify_env.py`, `scripts\prepare_models.py` and `scripts\ingest_demo.py` — **the `scripts\` folder does not exist in the repo**. Setup dies at “Import verification”.
 2. It installs `requirements.txt`, whose loose pins let pip resolve PyAV ≥ 19, which removed the `metadata_errors=` argument that `faster-whisper` 1.2.1 passes — so **audio ingestion breaks later**, at the worst possible moment.
@@ -263,6 +366,12 @@ Two smaller portability notes found while running it:
 | `scripts/prepare_models.py` | exit 0 — embedding loaded and encoded to 384-d, cross-encoder scored a pair (logit 2.357), Whisper loaded, Ollama generated a reply |
 | `scripts/ingest_demo.py` | exit 0 — built the index (6 sources / 37 items); on re-run, skipped all 6 by content hash in 0.0 s |
 | `scripts/smoke_test.py` | exit 0 — 4/4 questions answered; audio citation rendered as `00:00-00:21`; the unanswerable question abstained in <1 s **before** calling the LLM |
+| `evaluation.py` | exit 0 — 5 PASS / 1 CHECK; groundedness 1.0, hallucination rate 0.0, abstention accuracy 1.0, mean latency 8.8 s |
+| `scripts/calibrate_abstention.py` | dry runs only — it reports the threshold it would pick; `--apply` was **not** used, the committed thresholds are hand-set from measured score ranges |
+| `auth.py` + role gating | verified by direct tests: PBKDF2 hash/verify, unique salts, username/password/role validation, the three-role permission matrix, lockout after 5 failures (a locked account refuses the *correct* password), role/password change and deletion. Streamlit `AppTest` ran the whole UI as anonymous, viewer, analyst and admin with **0 exceptions**: anonymous sees only the bootstrap form, viewer sees the ingest block and the export-gated caption, admin sees Manage accounts and a delete button per source |
+| `delete_source` | verified by direct test: three sources ingested, the middle one deleted, and both survivors still resolved to the correct items by distinctive queries — before deletion, after deletion, and after reopening the index from disk |
+| `llm_judge.py` | verified by direct test on three answers with known verdicts (correct / wrong figure / describes-the-source). At `qwen2.5:0.5b` the judge replied "A" to all nine order-swapped questions, so consistency is 0.0 and no scores are published — the failure is reported, not hidden |
+| Streaming, numeric guard, OCR confidence, collections, chat history | verified by direct tests: streamed tokens with citations intact; guard caveat appended on a fabricated wrong figure and silent on a correct one; dashboard OCR 90.5% confidence with 0/14 numeric tokens withheld; scoped retrieval returned only in-collection sources through both retrieval legs; session saved with a replayable trace and exported to Markdown/CSV |
 | `scripts/verify_offline.py` | exit 0 — PASSED with **zero** outbound connections or DNS lookups |
 
 **Not executed:** `setup_windows.ps1`, `setup.ps1` and `start.ps1`. There is no PowerShell interpreter in the sandbox, so the installer was reviewed line by line (balanced braces, `param()` first, functions defined before use, pinned torch resolution, native-command exit codes) but **has never been run**. Two real bugs were found and fixed during that review: `-match` against a multi-line array does not populate `$Matches` (which would have made the Python version test silently fail), and nested quotes in the `cmd /c` venv creation. Treat the first run of `setup_windows.ps1` as the actual test, and report any error text back — the fixes will be small.
@@ -276,7 +385,11 @@ Also **not** tested on Windows-specific paths: `pyttsx3`/SAPI demo-audio generat
 - **`confidence` is not a probability of being correct.** It is a squashed cross-encoder rerank logit — a relative ordering signal. Always read the cited passage.
 - **The abstention gate is phrasing-sensitive.** Tuned by `ABSTENTION_THRESHOLD=-6.0`. A question with no supporting evidence is usually refused, but rewording can slip past it — test your own phrasings before trusting a demo.
 - **Small models degrade output.** With `qwen2.5:1.5b` or `0.5b` expect weaker wording, and occasional garbled numbers. That is the substitute model, not the pipeline.
-- **The image path depends on the model.** `qwen2.5vl:3b` can genuinely look at an image; text-only models fall back to OCR text, which is unreliable for charts and screenshots.
+- **The image path depends on the model.** `qwen2.5vl:3b` can genuinely look at an image; text-only models fall back to OCR text. OCR is now confidence-filtered and upscaled, which fixed the demo dashboard (mean confidence 63.6% → 90.5%, and the team size reads correctly as `6 engineers` instead of a fused `22024`) — but charts, handwriting and dense tables remain unreliable, and the system will now tell you so rather than guess.
+- **The numeric guard compares text, not meaning.** It catches figures absent from the evidence and normalises `32,000` / `32000`, `99.40` / `99.4` and `1.2 million` / `1200000`. It cannot catch a number that is *present* in the evidence but attached to the wrong subject — that is what citations are for.
+- **The sign-in gate and the API tokens are a local gate, not multi-tenant security.** Passwords are properly hashed and compared in constant time, and lockout slows guessing, but anyone with shell access to the machine already owns the index, the history and `auth\users.db`. Nothing is encrypted at rest — use OS/disk encryption if the corpus is sensitive. `api.py` is protected by per-account bearer tokens with role checks, and is still best kept on `127.0.0.1`.
+- **The LLM judge is unusable at 0.5b, measured.** It answered "A" to nine out of nine order-swapped questions about a correct answer, a wrong-figure answer and a non-answer. The consistency check catches this and reports `UNUSABLE` instead of publishing flattering scores; expect it to work with `qwen2.5vl:3b` or larger, and treat it as advisory either way.
+- **Chat history is local and unencrypted.** `history\chat_history.db` stores questions, answers and evidence excerpts in plain SQLite. Fine for one reviewer on one machine; do not put it on a shared drive without encrypting it.
 - **Whisper `base` on CPU** is accurate enough for clean speech but will struggle with noise, accents and overlapping speakers. Raise `WHISPER_MODEL_SIZE` to `small` if you have the RAM.
 
 ---
@@ -301,6 +414,85 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\python scripts\smoke_test.py
 .\.venv\Scripts\python scripts\verify_offline.py
 .\.venv\Scripts\python evaluation.py
+.\.venv\Scripts\python evaluation.py --judge          # advisory judge columns
+.\.venv\Scripts\python scripts\create_user.py --list    # local accounts
 ```
 
 Ports: **8501** UI · **8000** API · **11434** Ollama.
+
+---
+
+## 9. Corpus lifecycle, the evaluation gate, and chunking
+
+### Updating a file that is already indexed
+
+`source_id` is a content hash, so an edited file is a **new** source: the previous
+version stays indexed and keeps being cited beside the new one, and either can rank
+higher. Three ways to handle it:
+
+```powershell
+:: ingest and replace older versions of the same filename
+python scripts\ingest_demo.py --dir D:\reports --replace
+
+:: see which filenames have more than one indexed version
+:: (the UI shows the same list on the Sources tab, and offers a Replace button)
+
+:: rebuild the whole index from data\ with the current settings
+python scripts\reindex.py --dry-run
+python scripts\reindex.py --yes
+```
+
+`reindex.py` exists because `ingest_demo.py` **cannot** apply changed settings: an
+unchanged file is skipped by hash before extraction, so a new `CHUNK_SIZE`, OCR
+threshold or embedding model never touches it. `--force` re-extracts but leaves the old
+items in place beside the new ones. `reindex.py` starts from an empty index, preserves
+each source's collection, and leaves `history\chat_history.db` and `auth\users.db`
+alone — saved traces stay readable, which is the point of storing them.
+
+### The evaluation gate
+
+Dataset v2.0 is 16 queries over the demo corpus: the original six, two multi-hop
+questions whose answer needs a fact from one source joined to a fact from another,
+three adversarial ones (a near-miss year, a figure that does not exist, an entity that
+does not exist), a table-fidelity question with a more salient near-miss number, two
+per-modality pins, and two against the long academic deck. Each carries `notes` with
+its ground truth and where it comes from, so an expectation can be checked against the
+corpus instead of trusted.
+
+```powershell
+python evaluation.py                 # full run, writes json/csv/md into evaluation\reports
+python evaluation.py --compare       # gate against evaluation\baseline.json, exit 1 on any regression
+python evaluation.py --compare --tolerance 0.02 --strict-per-query
+python evaluation.py --save-baseline # promote this run to the shipped baseline
+```
+
+Gated metrics: retrieval precision/recall, MRR, citation accuracy, answer correctness,
+groundedness, abstention accuracy, hallucination rate and forbidden-leak rate —
+aggregate **and** per expected modality, so one modality collapsing cannot hide behind
+a healthy average. Latency and the numeric-guard rate are reported but never gated:
+latency measures the machine, and a higher guard rate can mean better honesty or worse
+OCR. Comparing across dataset versions is refused unless you pass
+`--allow-dataset-mismatch`, because the aggregates would not mean the same thing.
+
+Tolerance defaults to `0.0`. Generation at `qwen2.5:0.5b` still jitters a little
+run to run (citation accuracy moved 0.4135 → 0.401 between two runs on an identical
+index), so for routine checks `--tolerance 0.02` is the honest setting; keep `0.0`
+when you need to know that nothing at all moved.
+
+### Chunking: what is implemented and what is default
+
+`chunking.py` implements structure-aware splitting — Markdown/numbered/ALL-CAPS/Title
+Case headings form a heading stack, every chunk keeps its heading path (which becomes
+the citation's section and heads the evidence block the model reads), paragraphs built
+from wrapped PDF lines are never cut mid-sentence, table rows stay whole with the
+header row repeated onto every chunk, and `chunk_size` is a cap rather than a target.
+It also fixes the old splitter's mid-word cuts (`Extr|action`, `HT|ML`).
+
+It is **not the default**, on measurement. On dataset v2.0 it improved every retrieval
+metric — precision .3115 → .3240, MRR .615 → .672, citation accuracy .414 → .492,
+forbidden leaks .1875 → .125 — and cut answer correctness .8125 → .6458, so
+`--compare` failed it. The cause is known: finer chunks mean more items per file, and
+`mmr_max_per_source` (2) then keeps only two of them, so the one chunk holding the
+answer loses its slot to its own siblings. The fix is a wider per-source fan-out or
+small-to-big parent/child retrieval (`ContentItem.parent_id` already exists for it).
+Until that is measured, `CHUNKING_MODE=fixed` ships and `structure` stays opt-in.

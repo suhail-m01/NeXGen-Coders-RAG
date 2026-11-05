@@ -16,6 +16,16 @@ Run from the project root:
     .venv\\Scripts\\python scripts\\ingest_demo.py
     .venv\\Scripts\\python scripts\\ingest_demo.py --dir D:\\my\\files
     .venv\\Scripts\\python scripts\\ingest_demo.py --force
+
+An edited file is a NEW source, because source_id is a content hash: without
+--replace the previous version stays indexed and keeps being cited beside the
+new one (either can rank higher). --replace removes the older version(s) of the
+same filename as it indexes the new one:
+
+    .venv\\Scripts\\python scripts\\ingest_demo.py --dir D:\\reports --replace
+
+To re-extract the whole corpus under changed settings (chunking, OCR, models),
+use scripts\\reindex.py instead: --force re-extracts but keeps the old items.
 """
 from __future__ import annotations
 
@@ -40,8 +50,15 @@ def main() -> int:
     parser.add_argument("--dir", action="append", default=None,
                         help="ingest this directory instead of the demo data "
                              "(repeatable)")
+    parser.add_argument("--collection", default="general",
+                        help="Logical collection to file these sources under "
+                             "(default: general). Search can be scoped to it.")
     parser.add_argument("--force", action="store_true",
                         help="re-extract files that are already indexed")
+    parser.add_argument("--replace", action="store_true",
+                        help="when a filename is already indexed with different "
+                             "content, remove the older version(s) instead of "
+                             "keeping both")
     args = parser.parse_args()
 
     if args.dir:
@@ -115,7 +132,9 @@ def main() -> int:
             continue
 
         try:
-            result = pipeline.ingest_file(str(path))
+            result = pipeline.ingest_file(
+                str(path), collection=args.collection, replace=args.replace
+            )
         except Exception as exc:
             fail_count += 1
             print(f"  {path.name:<28} {'-':<9} {'-':>6} {'-':>5} "
@@ -149,6 +168,16 @@ def main() -> int:
     print(f"  New items this run: {total_items}   relationships: {total_rels}")
     if ok_count == 0 and fail_count == 0 and skipped_count:
         print("  Nothing was new - the index already covers these files.")
+
+    stale = pipeline.stale_versions()
+    if stale:
+        print(f"\n  [WARN] {len(stale)} filename(s) have more than one indexed version:")
+        for name, versions in sorted(stale.items()):
+            ids = ", ".join(v.source_id[:12] for v in versions)
+            print(f"         {name}: {ids}")
+        if args.replace:
+            print("         (--replace was requested; these came from files not in this run)")
+        print("         Re-run with --replace to keep only the newest, or delete them in the UI.")
 
     health = pipeline.health()
     index = health.get("index", {})

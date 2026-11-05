@@ -1,14 +1,26 @@
 """
 api.py -- FastAPI surface over rag_pipeline.
 
-    GET  /health              runtime and index status
-    POST /ingest              upload and index one or more files
-    POST /query               ask a question (text / image / audio / document)
-    GET  /source/{source_id}  inspect an indexed source and its items
-    GET  /sources             list indexed sources
+    GET  /health                 runtime and index status
+    POST /ingest                 upload and index one or more files
+    POST /query                  ask a question (text / image / audio / document)
+    POST /query_file             ask using an uploaded image / audio / document
+    GET  /sources                list indexed sources
+    GET  /source/{source_id}     inspect an indexed source and its items
+    GET  /source/{source_id}/file  download the original file
+    DELETE /source/{source_id}   remove a source from the index (admin)
 
 Every endpoint delegates to the same RAGPipeline the Streamlit UI uses, so
 there is one implementation of the RAG logic, not two.
+
+Every endpoint except /health requires a bearer token:
+
+    Authorization: Bearer eai_...
+
+Tokens are minted per account (scripts\\create_user.py --create-token) and carry
+that account's role, so a viewer token cannot ingest and an analyst token cannot
+delete. Set API_AUTH_ENABLED=false in .env to turn this off -- which leaves the
+API open on whatever interface it is bound to.
 
 Run:  .venv\\Scripts\\uvicorn api:app --port 8000
 """
@@ -18,7 +30,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from config import settings
@@ -53,6 +65,42 @@ app.add_middleware(
 )
 
 
+def require(permission: str):
+    """FastAPI dependency: resolve a bearer token and check one permission.
+
+    401 for a missing, unknown or revoked token; 403 for a valid token whose
+    role is not allowed. The two are kept distinct so a caller can tell "your
+    credential is wrong" from "your role cannot do this".
+    """
+    from auth import can, get_user_store
+
+    def dependency(authorization: str | None = Header(default=None)) -> dict:
+        if not settings.api_auth_enabled:
+            return {"username": "api-auth-disabled", "role": "admin", "via": "disabled"}
+        if not authorization or not authorization.lower().startswith("bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail={"error": "Missing bearer token.",
+                        "hint": "Authorization: Bearer eai_... "
+                                "(scripts\\create_user.py --create-token)"},
+            )
+        account = get_user_store().authenticate_token(authorization.split(" ", 1)[1].strip())
+        if account is None:
+            raise HTTPException(
+                status_code=401,
+                detail={"error": "Unknown, revoked or expired token."},
+            )
+        if not can(account["role"], permission):
+            raise HTTPException(
+                status_code=403,
+                detail={"error": f"Role '{account['role']}' may not {permission}.",
+                        "username": account["username"]},
+            )
+        return account
+
+    return dependency
+
+
 @app.get("/health")
 def health(backend: str | None = None) -> dict:
     """Runtime status for the selected inference backend.
@@ -69,10 +117,27 @@ def health(backend: str | None = None) -> dict:
 
 
 @app.post("/ingest")
-async def ingest(files: list[UploadFile] = File(...)) -> dict:
+async def ingest(
+    files: list[UploadFile] = File(...),
+    collection: str = Form("general"),
+    replace: bool = Form(False),
+    account: dict = Depends(require("ingest")),
+) -> dict:
     """Upload and index files. Returns a per-file result rather than failing
-    the whole batch when one file is bad."""
+    the whole batch when one file is bad.
+
+    `replace=true` removes older indexed versions of the same filename. That is
+    a deletion, so it needs the delete permission on top of ingest.
+    """
+    from auth import can
+
     pipeline = get_pipeline()
+    if replace and not can(account["role"], "delete"):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": f"Role '{account['role']}' may ingest but not replace "
+                             "existing sources (needs the delete permission)."},
+        )
     results = []
 
     for upload in files:
@@ -88,7 +153,9 @@ async def ingest(files: list[UploadFile] = File(...)) -> dict:
                 continue
 
             stored_path = pipeline.store_upload(upload.filename or "upload", data)
-            result = pipeline.ingest_file(str(stored_path))
+            result = pipeline.ingest_file(
+                str(stored_path), collection=collection, replace=replace
+            )
             results.append({
                 "filename": result.source.filename,
                 "source_id": result.source.source_id,
@@ -117,7 +184,11 @@ async def ingest(files: list[UploadFile] = File(...)) -> dict:
 
 
 @app.post("/query")
-def query(request: QueryRequest, backend: str | None = None) -> dict:
+def query(
+    request: QueryRequest,
+    backend: str | None = None,
+    account: dict = Depends(require("ask")),
+) -> dict:
     """Text query against the index.
 
     `backend` ("offline" | "online") selects the inference provider and
@@ -146,6 +217,8 @@ async def query_file(
     top_k: int = Form(settings.top_k),
     rerank_top_k: int = Form(settings.rerank_top_k),
     backend: str | None = Form(None),
+    collection: str | None = Form(None),
+    account: dict = Depends(require("ask")),
 ) -> QueryResponse:
     """Query using an uploaded image, audio clip, or document as the query.
 
@@ -166,19 +239,27 @@ async def query_file(
             inference_mode=inference_mode,
             query_modality=query_modality,
             query_file_path=temp_path,
+            collection=collection,
         ), backend=backend)
     finally:
         Path(temp_path).unlink(missing_ok=True)
 
 
 @app.get("/sources")
-def list_sources() -> dict:
-    sources = get_pipeline().store.list_sources()
-    return {"count": len(sources), "sources": [s.model_dump() for s in sources]}
+def list_sources(
+    collection: str | None = None,
+    account: dict = Depends(require("ask")),
+) -> dict:
+    sources = get_pipeline().store.list_sources(collection)
+    return {
+        "count": len(sources),
+        "sources": [s.model_dump() for s in sources],
+        "collections": get_pipeline().store.list_collections(),
+    }
 
 
 @app.get("/source/{source_id}")
-def get_source(source_id: str) -> dict:
+def get_source(source_id: str, account: dict = Depends(require("ask"))) -> dict:
     detail = get_pipeline().get_source_detail(source_id)
     if detail is None:
         raise HTTPException(
@@ -190,7 +271,9 @@ def get_source(source_id: str) -> dict:
 
 
 @app.get("/source/{source_id}/file")
-def get_source_file(source_id: str) -> FileResponse:
+def get_source_file(
+    source_id: str, account: dict = Depends(require("ask"))
+) -> FileResponse:
     """Serve the original file. Constrained to data/ so a crafted source_id
     cannot read arbitrary paths off the filesystem."""
     pipeline = get_pipeline()
@@ -207,3 +290,26 @@ def get_source_file(source_id: str) -> FileResponse:
             detail={"error": "Source file is outside the managed data directory."},
         )
     return FileResponse(path, filename=source.filename)
+
+
+@app.delete("/source/{source_id}")
+def delete_source(source_id: str, account: dict = Depends(require("delete"))) -> dict:
+    """Remove a source and its items from the index. The original file and any
+    chat-history traces survive; see VectorStore.delete_source."""
+    pipeline = get_pipeline()
+    source = pipeline.store.get_source(source_id)
+    if source is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": ErrorCode.SOURCE_NOT_FOUND.value,
+                    "source_id": source_id},
+        )
+    removed = pipeline.delete_source(source_id)
+    logger.info("%s deleted source %s (%d items)", account["username"], source_id, removed)
+    return {
+        "deleted": source.filename,
+        "source_id": source_id,
+        "items_removed": removed,
+        "index": pipeline.store.stats(),
+        "note": "The original file on disk and any saved chat history were left untouched.",
+    }

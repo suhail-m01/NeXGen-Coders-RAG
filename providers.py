@@ -117,6 +117,20 @@ class InferenceProvider(ABC):
     ) -> str:
         """Produce the answer text. Raises ProviderError on failure."""
 
+    def generate_stream(
+        self,
+        query: str,
+        evidence: list[RerankedResult],
+        filenames: dict[str, str],
+        inspect_image: Path | None = None,
+    ):
+        """Yield answer chunks. Default: one chunk holding the full answer.
+
+        Providers that can stream natively override this; callers may always
+        rely on the generator protocol either way.
+        """
+        yield self.generate(query, evidence, filenames, inspect_image=inspect_image)
+
     @property
     @abstractmethod
     def model_name(self) -> str:
@@ -175,6 +189,26 @@ class OllamaProvider(InferenceProvider):
         try:
             return generate_answer(query, evidence, filenames,
                                    inspect_image=inspect_image)
+        except OllamaError as exc:
+            raise ProviderError(
+                "Offline AI could not generate an answer.",
+                _redact(str(exc)),
+                exc.code,
+            ) from exc
+
+    def generate_stream(
+        self,
+        query: str,
+        evidence: list[RerankedResult],
+        filenames: dict[str, str],
+        inspect_image: Path | None = None,
+    ):
+        from llm import OllamaError, generate_answer_stream
+
+        try:
+            yield from generate_answer_stream(
+                query, evidence, filenames, inspect_image=inspect_image
+            )
         except OllamaError as exc:
             raise ProviderError(
                 "Offline AI could not generate an answer.",
@@ -314,6 +348,7 @@ class OpenAIProvider(InferenceProvider):
             "model": settings.online_model,
             "messages": self._build_messages(prompt, inspect_image),
             "temperature": settings.ollama_temperature,
+            **({"seed": settings.ollama_seed} if settings.ollama_seed > 0 else {}),
         }
 
         request = urllib.request.Request(

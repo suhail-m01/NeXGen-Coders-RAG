@@ -239,12 +239,36 @@ def process_audio(path_str: str) -> IngestionResult:
                 f"{MIN_SEGMENT_CHARS} characters."
             )
 
+        speaker_labels: list[str | None] = [None] * len(kept)
+        if settings.diarization_enabled:
+            from diarization import available as diarization_available
+            from diarization import diarize_segments
+
+            if diarization_available():
+                try:
+                    speaker_labels, diarization_warning = diarize_segments(path, kept)
+                except Exception as exc:  # enrichment must never break ingestion
+                    speaker_labels, diarization_warning = (
+                        [None] * len(kept),
+                        f"Speaker diarization skipped: {exc.__class__.__name__}",
+                    )
+                if diarization_warning:
+                    warnings.append(diarization_warning)
+            else:
+                warnings.append(
+                    "Speaker diarization skipped: install librosa and "
+                    "scikit-learn to label speakers."
+                )
+
         items = [
             ContentItem(
                 item_id=derive_id(source.source_id, "audio", index),
                 source_id=source.source_id,
                 modality=Modality.AUDIO,
-                content=segment["text"],
+                content=(
+                    f"{speaker_labels[index]} {segment['text']}"
+                    if speaker_labels[index] else segment["text"]
+                ),
                 location=SourceLocation(
                     timestamp_start=segment["start"],
                     timestamp_end=segment["end"],
@@ -254,6 +278,7 @@ def process_audio(path_str: str) -> IngestionResult:
                     "duration_s": round(segment["end"] - segment["start"], 2),
                     "merged_segments": segment.get("segment_count", 1),
                     "whisper_model": settings.whisper_model_size,
+                    "speaker": speaker_labels[index],
                 },
             )
             for index, segment in enumerate(kept)

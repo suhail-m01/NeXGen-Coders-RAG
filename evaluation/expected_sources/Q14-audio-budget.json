@@ -1,0 +1,7 @@
+{
+  "id": "Q14-audio-budget",
+  "expected_sources": [
+    "project_meeting.wav"
+  ],
+  "expected_modality": "audio"
+}

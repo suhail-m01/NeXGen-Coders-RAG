@@ -1,0 +1,7 @@
+{
+  "id": "Q13-image-deployment",
+  "expected_sources": [
+    "project_dashboard.png"
+  ],
+  "expected_modality": "image"
+}

@@ -1,0 +1,7 @@
+{
+  "id": "Q15-longdoc",
+  "expected_sources": [
+    "MCA_MP_58-mini-project.pdf"
+  ],
+  "expected_modality": "text"
+}

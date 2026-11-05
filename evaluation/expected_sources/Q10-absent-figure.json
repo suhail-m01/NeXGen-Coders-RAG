@@ -1,0 +1,8 @@
+{
+  "id": "Q10-absent-figure",
+  "expected_sources": [
+    "project_report.pdf",
+    "project_notes.docx"
+  ],
+  "expected_modality": "text"
+}

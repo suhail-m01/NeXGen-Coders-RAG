@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     # little room for text evidence alongside it.
     ollama_num_ctx: int = 8192
     ollama_temperature: float = 0.0
+    # A fixed seed makes answers reproducible run-to-run. Essential for an
+    # evidence tool and for comparing evaluation reports. Set <= 0 to let the
+    # server pick (non-reproducible sampling).
+    ollama_seed: int = 42
 
     # ---- Local models -------------------------------------------------
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -93,10 +97,34 @@ class Settings(BaseSettings):
     whisper_model_size: str = "base"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
+    # Local speaker diarization (MFCC embeddings + clustering). Adds speaker
+    # labels to audio segments; degrades gracefully to plain timestamps when
+    # librosa/scikit-learn are unavailable.
+    diarization_enabled: bool = True
+    diarization_max_speakers: int = 6
     # 4GB VRAM is fully committed to Ollama; PyTorch stays on CPU.
     torch_device: str = "cpu"
 
     # ---- Chunking -----------------------------------------------------
+    # "fixed" splits on a character window with overlap (the original behaviour).
+    # "structure" splits on headings, paragraphs and table rows and keeps the
+    # heading path with each chunk (chunking.py). chunk_size is a cap in both
+    # modes; chunk_overlap only applies where a block had to be cut, because
+    # structure-aware chunking already breaks at seams.
+    #
+    # Default is "fixed" on measurement, not preference. Structure-aware chunking
+    # improved every retrieval metric (precision .3115 -> .3240, MRR .615 ->
+    # .672, citation accuracy .414 -> .492, forbidden leaks .1875 -> .125) and
+    # fixed the old splitter's mid-word cuts, but it cut answer correctness
+    # 0.8125 -> 0.6458 on dataset v2.0 and evaluation.py --compare failed it.
+    # Cause: finer chunks mean more items per file, and mmr_max_per_source then
+    # keeps only two of them, so the one chunk holding the answer loses its slot
+    # to its own siblings. It stays in the tree as an opt-in because the fix is
+    # known (wider retrieval fan-out per source, or small-to-big parent/child
+    # retrieval), not because it is finished.
+    # Changing this changes how every document splits: run scripts/reindex.py
+    # afterwards, since ingestion skips already-indexed files by content hash.
+    chunking_mode: str = "fixed"
     chunk_size: int = 800
     chunk_overlap: int = 100
     min_chunk_chars: int = 40
@@ -104,6 +132,21 @@ class Settings(BaseSettings):
     # ---- Retrieval ----------------------------------------------------
     top_k: int = 10
     rerank_top_k: int = 5
+    # Hybrid lexical leg: BM25 fused with the dense ranking via RRF. Catches
+    # exact tokens (IDs, percentages, names) that semantic search smooths over.
+    hybrid_enabled: bool = True
+    hybrid_rrf_k: int = 60
+    hybrid_lexical_k: int = 20
+    # Length normalisation: the cross-encoder mildly prefers long chunks, so
+    # chunks above the threshold take a fixed penalty before ranking.
+    rerank_length_norm: bool = True
+    rerank_length_threshold_chars: int = 600
+    rerank_length_penalty: float = 0.2
+    # MMR diversity re-selection over an over-fetched rerank pool. The per-source
+    # cap keeps one document from crowding out other modalities.
+    mmr_enabled: bool = True
+    mmr_lambda: float = 0.7
+    mmr_max_per_source: int = 2
 
     # ---- Relationships ------------------------------------------------
     related_to_threshold: float = 0.70
@@ -119,8 +162,70 @@ class Settings(BaseSettings):
     # ---- Grounding / abstention ----------------------------------------
     # Cross-encoder logit below which evidence is considered unsupportive.
     abstention_threshold: float = -6.0
+    # OCR-derived image evidence scores ~6 logits lower than text evidence, so
+    # it needs its own (lower) threshold to be judged on its own scale.
+    abstention_threshold_image: float = -9.0
+    # Deterministic coverage guard: numbers/years the question commits to must
+    # appear in the evidence. Years only by default; all-numbers mode can
+    # refuse legitimate rephrasings ("1.2 million" vs "1200000").
+    coverage_guard_enabled: bool = True
+    # Stream answer tokens into the UI instead of one batched block.
+    streaming_enabled: bool = True
+    coverage_guard_all_numbers: bool = False
+    # Numeric verification guard (post-generation). Any figure in the answer
+    # that appears nowhere in the retrieved evidence gets a visible caveat.
+    # It never deletes or refuses an answer -- a false positive costs one
+    # sentence, a silently wrong number costs trust.
+    numeric_guard_enabled: bool = True
+    # Figures shorter than this are ignored ("3 items", "page 5"): short
+    # numbers are too easy to paraphrase legitimately to police.
+    numeric_guard_min_digits: int = 2
     # Cosine similarity required to attribute an answer sentence to evidence.
     citation_threshold: float = 0.35
+
+    # ---- OCR quality ---------------------------------------------------
+    # Tesseract reports a confidence per word. Keeping only trustworthy words
+    # and telling the LLM when the rest is guesswork is the difference between
+    # "the dashboard shows 22,024" and "OCR could not read this reliably".
+    ocr_confidence_enabled: bool = True
+    # Prose words below this Tesseract confidence (0-100) are dropped.
+    ocr_min_word_confidence: float = 40.0
+    # Tokens containing a digit need more. Measured on the demo dashboard:
+    # prose scored 86-94 while digits averaged 52.6, and the digit that caused
+    # a confident hallucination ("22024", the team size 22 fused with the year
+    # 2024) scored 51. A misread letter reads as noise; a misread digit
+    # silently becomes a different fact, so it is held to a higher bar.
+    ocr_min_digit_confidence: float = 60.0
+    # Mean confidence of the kept words below which the passage is annotated
+    # as unreliable and reported to the user as an ingestion warning.
+    ocr_low_confidence_threshold: float = 60.0
+    # Tesseract's sweet spot is roughly a 30px cap height. Screenshots and
+    # dashboards are usually rendered well below it: on the demo dashboard,
+    # OCR at native size scored a 63.6% mean confidence and fused the team
+    # size into a nonexistent "22024", while a 2x upscale scored 90.5% and
+    # read the real values ("6" engineers, 320k, 240k). Small images are
+    # therefore upscaled toward this target; large scans already clear it and
+    # are left alone, since upscaling them only costs time.
+    ocr_target_longest_px: int = 2200
+    ocr_max_upscale: int = 4
+    # A page that loses one digit out of forty is fine; a page where a quarter
+    # of its numbers were unreadable is not quotable. Proportional, so long
+    # scanned documents do not warn on a single bad token.
+    ocr_digit_drop_ratio: float = 0.25
+
+    # ---- Local accounts (UI gate) --------------------------------------
+    # PBKDF2-HMAC-SHA256 iterations per password check. 200k is roughly
+    # 100-200 ms on a laptop CPU: slow enough to make guessing expensive, fast
+    # enough that logging in does not feel broken.
+    auth_pbkdf2_iterations: int = 200_000
+    auth_min_password_length: int = 10
+    auth_max_failed_attempts: int = 5
+    auth_lockout_minutes: int = 5
+    # Bearer tokens for api.py, checked against the same accounts and roles as
+    # the UI. Turning this off makes the API an open door on whatever interface
+    # it is bound to -- leave it on unless the port is loopback-only and the
+    # machine is trusted.
+    api_auth_enabled: bool = True
 
     # ---- Ingestion limits (security) -----------------------------------
     max_file_bytes: int = 200 * 1024 * 1024
@@ -155,6 +260,18 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return self.index_dir / "store.db"
+
+    @property
+    def auth_db(self) -> Path:
+        """Accounts live beside chat history and outside the index: rebuilding
+        the corpus must not log everybody out or delete the role assignments."""
+        return self.data_dir.parent / "auth" / "users.db"
+
+    @property
+    def history_db(self) -> Path:
+        """Chat sessions deliberately live outside the index: rebuilding or
+        deleting the index must not destroy a reviewer's conversation."""
+        return self.data_dir.parent / "history" / "chat_history.db"
 
     def ensure_dirs(self) -> None:
         for path in (

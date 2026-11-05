@@ -47,6 +47,14 @@ Rules you must follow without exception:
 9. Be concise: at most one short paragraph unless the question needs more.
 """
 
+# Measured, and reverted: a tenth rule telling the model to synthesise across
+# EVIDENCE blocks instead of reproducing one did not change qwen2.5:0.5b's
+# behaviour on the cross-modal query at all, while a matching change to the
+# closing instruction destabilised a previously correct answer ("1.2 million"
+# came back as "0.12 million", which the numeric guard caught). Answer-level
+# metrics at this model size re-roll on any prompt edit, so prompt changes are
+# only kept when they measurably help. See WINDOWS_SETUP_GUIDE.md section 8.
+
 DISCOVERY_RULES = """You are Evidence AI, a grounded evidence-discovery system.
 
 The user is not asking a factual question. They are asking WHICH SOURCES in
@@ -143,8 +151,17 @@ def ollama_available() -> tuple[bool, str]:
     return True, f"Ollama ready with {settings.ollama_model}"
 
 
-def ollama_generate(prompt: str, image_paths: list[Path] | None = None) -> str:
-    """One non-streaming local generation. Optionally attaches local images."""
+def ollama_generate(
+    prompt: str,
+    image_paths: list[Path] | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """One non-streaming local generation. Optionally attaches local images.
+
+    `max_tokens` caps the reply. The LLM judge uses it: a small model asked a
+    yes/no question will otherwise keep doing the underlying task instead of
+    answering, and a hard cap is what keeps its reply parseable.
+    """
     payload: dict = {
         "model": settings.ollama_model,
         "prompt": prompt,
@@ -153,6 +170,8 @@ def ollama_generate(prompt: str, image_paths: list[Path] | None = None) -> str:
         "options": {
             "num_ctx": settings.ollama_num_ctx,
             "temperature": settings.ollama_temperature,
+            **({"seed": settings.ollama_seed} if settings.ollama_seed > 0 else {}),
+            **({"num_predict": max_tokens} if max_tokens else {}),
         },
     }
 
@@ -173,6 +192,78 @@ def ollama_generate(prompt: str, image_paths: list[Path] | None = None) -> str:
     if not text:
         raise OllamaError("Ollama returned an empty response.", ErrorCode.VISION_FAILED)
     return text
+
+
+def ollama_generate_stream(prompt: str, image_paths: list[Path] | None = None):
+    """Yield answer tokens as Ollama generates them (NDJSON, stream=True).
+
+    Same payload and error semantics as ollama_generate; the only difference
+    is that the response body is consumed line by line so the first token
+    reaches the caller in seconds instead of after the whole answer.
+    """
+    payload: dict = {
+        "model": settings.ollama_model,
+        "prompt": prompt,
+        "stream": True,
+        "keep_alive": settings.ollama_keep_alive,
+        "options": {
+            "num_ctx": settings.ollama_num_ctx,
+            "temperature": settings.ollama_temperature,
+            **({"seed": settings.ollama_seed} if settings.ollama_seed > 0 else {}),
+        },
+    }
+
+    if image_paths:
+        encoded: list[str] = []
+        for path in image_paths[: settings.max_inspect_images]:
+            resolved = Path(path).resolve()
+            if not resolved.exists():
+                raise OllamaError(
+                    f"{ErrorCode.FILE_NOT_FOUND.value}: {resolved}",
+                    ErrorCode.FILE_NOT_FOUND,
+                )
+            encoded.append(base64.b64encode(resolved.read_bytes()).decode("utf-8"))
+        payload["images"] = encoded
+
+    url = f"{settings.ollama_host.rstrip('/')}/api/generate"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=settings.ollama_timeout
+        ) as resp:
+            for raw in resp:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                token = event.get("response") or ""
+                if token:
+                    yield token
+                if event.get("done"):
+                    break
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:300]
+        if "not found" in body.lower():
+            raise OllamaError(
+                f"Model '{settings.ollama_model}' is not installed. "
+                f"Run: ollama pull {settings.ollama_model}",
+                ErrorCode.QWEN_MODEL_NOT_AVAILABLE,
+            ) from exc
+        raise OllamaError(f"Ollama HTTP {exc.code}: {body}",
+                          ErrorCode.OLLAMA_NOT_AVAILABLE) from exc
+    except urllib.error.URLError as exc:
+        raise OllamaError(
+            f"Cannot reach Ollama at {settings.ollama_host}. Is it running? ({exc.reason})",
+            ErrorCode.OLLAMA_NOT_AVAILABLE,
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +330,18 @@ def generate_answer(
     prompt = build_prompt(query, evidence, filenames)
     images = [inspect_image] if inspect_image else None
     return ollama_generate(prompt, image_paths=images)
+
+
+def generate_answer_stream(
+    query: str,
+    evidence: list[RerankedResult],
+    filenames: dict[str, str],
+    inspect_image: Path | None = None,
+):
+    """Streaming twin of generate_answer: yields tokens, same prompt rules."""
+    prompt = build_prompt(query, evidence, filenames)
+    images = [inspect_image] if inspect_image else None
+    yield from ollama_generate_stream(prompt, image_paths=images)
 
 
 def pick_inspectable_image(evidence: list[RerankedResult]) -> Path | None:

@@ -1,0 +1,9 @@
+{
+  "id": "Q8-multihop-milestones",
+  "expected_sources": [
+    "project_notes.docx",
+    "project_metrics.csv",
+    "project_dashboard.png"
+  ],
+  "expected_modality": "text"
+}

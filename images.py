@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 
 from config import settings
+from ocr import OcrResult, annotate, warning_for
 from schemas import (
     ContentItem,
     ErrorCode,
@@ -84,26 +85,19 @@ def _load_image(path: Path):
         raise ValueError(f"{ErrorCode.CORRUPT_FILE.value}: {exc}") from exc
 
 
-def run_ocr(pil_image) -> str:
+def run_ocr_detailed(pil_image) -> OcrResult:
     """Plain grayscale first (best for clean screenshots and rendered text),
-    Otsu threshold as a fallback for low-contrast scans. Returns '' on
-    failure -- OCR is a supporting signal, not a hard requirement."""
-    import cv2
-    import numpy as np
-    import pytesseract
+    Otsu threshold as a fallback for low-contrast scans. Returns an OcrResult
+    carrying the per-word confidence Tesseract reported; empty on failure --
+    OCR is a supporting signal, not a hard requirement."""
+    from ocr import ocr_with_confidence
 
-    pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
-    try:
-        bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        text = pytesseract.image_to_string(gray).strip()
-        if text:
-            return text
-        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return pytesseract.image_to_string(otsu).strip()
-    except Exception as exc:
-        logger.warning("Tesseract OCR failed: %s", exc)
-        return ""
+    return ocr_with_confidence(pil_image)
+
+
+def run_ocr(pil_image) -> str:
+    """Text-only OCR, for callers that do not need the confidence signal."""
+    return run_ocr_detailed(pil_image).text
 
 
 def describe_image(path: Path) -> str:
@@ -145,7 +139,12 @@ def process_image(path_str: str) -> IngestionResult:
 
         pil_image = _load_image(path)
         width, height = pil_image.size
-        ocr_text = run_ocr(pil_image)
+        ocr = run_ocr_detailed(pil_image)
+        if ocr.unreliable:
+            warnings.append(warning_for(ocr))
+        # The caveat goes into the embedded content so the LLM sees it; the raw
+        # text stays in metadata so the UI can badge it instead of repeating it.
+        ocr_text = annotate(ocr.text, ocr)
 
         description = ""
         vision_ok = True
@@ -174,7 +173,14 @@ def process_image(path_str: str) -> IngestionResult:
             content=content,
             location=SourceLocation(image_path=str(path)),
             metadata={
-                "ocr_text": ocr_text,
+                "ocr_text": ocr.text,
+                "ocr_confidence": round(ocr.confidence, 1),
+                "ocr_words_kept": ocr.words_kept,
+                "ocr_words_total": ocr.words_total,
+                "ocr_digits_dropped": ocr.digits_dropped,
+                "ocr_digits_total": ocr.digits_total,
+                "ocr_upscale": ocr.upscale,
+                "ocr_unreliable": ocr.unreliable,
                 "visual_description": description,
                 "vision_ok": vision_ok,
                 "width": width,

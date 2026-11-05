@@ -1,6 +1,6 @@
 {
-  "dataset_version": "1.0",
-  "description": "Evidence AI fixed evaluation set over the Project Alpha synthetic demo corpus.",
+  "dataset_version": "2.0",
+  "description": "Evidence AI fixed evaluation set over the Project Alpha synthetic demo corpus. v2.0 adds multi-hop, adversarial and per-modality queries to the original six.",
   "queries": [
     {
       "id": "Q1-pdf",
@@ -13,7 +13,11 @@
       "expect_abstention": false,
       "answer_keywords": [
         "1.2 million"
-      ]
+      ],
+      "tags": [
+        "single-hop"
+      ],
+      "notes": "Report p.2: 'During 2024 the ingestion platform processed 1.2 million records'."
     },
     {
       "id": "Q2-docx",
@@ -27,7 +31,11 @@
       "expect_abstention": false,
       "answer_keywords": [
         "latency"
-      ]
+      ],
+      "tags": [
+        "single-hop"
+      ],
+      "notes": "Notes, 'Open Risks': batch pipeline latency under peak load is the top risk carried into 2025."
     },
     {
       "id": "Q3-image",
@@ -40,7 +48,12 @@
       "expect_abstention": false,
       "answer_keywords": [
         "6"
-      ]
+      ],
+      "tags": [
+        "modality:image",
+        "ocr"
+      ],
+      "notes": "Dashboard tile 'Team size / 6 engineers'. At native resolution OCR fused adjacent glyphs and produced '22024'; the 2x upscale plus digit-confidence rule is what makes this answerable."
     },
     {
       "id": "Q4-audio",
@@ -53,7 +66,12 @@
       "expect_abstention": false,
       "answer_keywords": [
         "99.4"
-      ]
+      ],
+      "tags": [
+        "modality:audio",
+        "asr"
+      ],
+      "notes": "Transcript segment 1: 'classification accuracy reached 99.4%'."
     },
     {
       "id": "Q5-crossmodal",
@@ -70,7 +88,12 @@
       "answer_keywords": [
         "1.2 million",
         "99.4"
-      ]
+      ],
+      "tags": [
+        "cross-modal",
+        "synthesis"
+      ],
+      "notes": "Deliberately broad: every Project Alpha source is relevant. This is the query that measures synthesis rather than lookup -- a 0.5b model tends to copy the first evidence block instead of combining two figures."
     },
     {
       "id": "Q6-unanswerable",
@@ -79,7 +102,220 @@
       "expected_sources": [],
       "expected_modality": "none",
       "expect_abstention": true,
-      "answer_keywords": []
+      "answer_keywords": [],
+      "tags": [
+        "adversarial",
+        "out-of-range"
+      ],
+      "notes": "No 2040 anything exists in the corpus."
+    },
+    {
+      "id": "Q7-multihop-budget",
+      "query": "Which quarter used the most budget, and what explanation did finance ask for?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_metrics.csv",
+        "project_notes.docx",
+        "project_report.pdf"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "Q4",
+        "87",
+        "underspend"
+      ],
+      "tags": [
+        "multi-hop",
+        "table+prose"
+      ],
+      "notes": "Hop 1 is a table maximum: budget_used_pct peaks at 87 in the Q4 2024 CSV row. Hop 2 is prose: the notes say finance asked for a written explanation of the infrastructure underspend, and report p.3 says the underspend was concentrated in infrastructure. Neither source alone answers the question."
+    },
+    {
+      "id": "Q8-multihop-milestones",
+      "query": "In which quarter was the NLP module deployed, and how many milestones were completed in that quarter?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_notes.docx",
+        "project_metrics.csv",
+        "project_dashboard.png"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "Q2",
+        "4"
+      ],
+      "tags": [
+        "multi-hop"
+      ],
+      "notes": "Hop 1 identifies Q2 2024 (dashboard tile, notes table, audio 'second quarter of 2024'). Hop 2 counts that quarter's milestones: 4, in both the CSV row and the notes table. '4' is a weak keyword on its own, which is why it is paired with 'Q2'."
+    },
+    {
+      "id": "Q9-adversarial-year",
+      "query": "How many records did the ingestion platform process in 2023?",
+      "query_modality": "text",
+      "expected_sources": [],
+      "expected_modality": "none",
+      "expect_abstention": true,
+      "answer_keywords": [],
+      "must_not_contain": [
+        "1.2 million",
+        "1,200,000",
+        "1200000",
+        "240000"
+      ],
+      "tags": [
+        "adversarial",
+        "near-miss-year"
+      ],
+      "notes": "2023 appears in the corpus exactly once, as the launch year (report p.1). Every record count belongs to 2024. Answering with the 2024 figure means the system matched the topic and ignored the constraint."
+    },
+    {
+      "id": "Q10-absent-figure",
+      "query": "What was Project Alpha's total budget in US dollars?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_report.pdf",
+        "project_notes.docx"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "87"
+      ],
+      "must_not_contain": [
+        "$",
+        "USD"
+      ],
+      "tags": [
+        "adversarial",
+        "absent-figure"
+      ],
+      "notes": "The corpus gives utilisation as a percentage (87 percent of the allocated amount) and never an absolute sum. The correct answer reports the percentage and says no dollar figure is stated; must_not_contain catches a system that manufactures one."
+    },
+    {
+      "id": "Q11-entity-confusion",
+      "query": "How many engineers were on the Project Beta team?",
+      "query_modality": "text",
+      "expected_sources": [],
+      "expected_modality": "none",
+      "expect_abstention": true,
+      "answer_keywords": [],
+      "must_not_contain": [
+        "6 engineers",
+        "six engineers",
+        "6",
+        "six"
+      ],
+      "tags": [
+        "adversarial",
+        "entity-confusion",
+        "known-hard"
+      ],
+      "notes": "There is no Project Beta. Marked known-hard on purpose: the numeric guard checks figures against evidence but nothing checks entity names, so the six-engineer fact will probably be served up for Beta -- a first run answered simply '6'. The bare number is forbidden too, because 'Project Beta had 6' is the same leak in fewer words. This query records the gap instead of hiding it."
+    },
+    {
+      "id": "Q12-table-near-miss",
+      "query": "According to the metrics table, what was the classification accuracy in Q3 2024?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_metrics.csv"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "99.0"
+      ],
+      "must_not_contain": [
+        "99.4"
+      ],
+      "tags": [
+        "table-fidelity",
+        "near-miss-number"
+      ],
+      "notes": "CSV row 3 says 99.0 for Q3 2024. The adjacent Q4 row says 99.4, and 99.4 also appears in the report, the notes, the dashboard and the recording. Answering 99.4 means salience beat the row that was asked for."
+    },
+    {
+      "id": "Q13-image-deployment",
+      "query": "According to the dashboard image, when was the NLP module deployed?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_dashboard.png"
+      ],
+      "expected_modality": "image",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "Q2 2024"
+      ],
+      "tags": [
+        "modality:image",
+        "ocr"
+      ],
+      "notes": "Dashboard tile 'NLP module deployed / Q2 2024', read by OCR at 90.5% mean word confidence after adaptive upscaling."
+    },
+    {
+      "id": "Q14-audio-budget",
+      "query": "What did the quarterly review recording say about budget utilisation?",
+      "query_modality": "text",
+      "expected_sources": [
+        "project_meeting.wav"
+      ],
+      "expected_modality": "audio",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "87"
+      ],
+      "tags": [
+        "modality:audio",
+        "asr"
+      ],
+      "notes": "Whisper renders the line as 'Budget utilization time at 87%' -- the verb is wrong, the figure is right -- so the keyword is the number rather than the sentence."
+    },
+    {
+      "id": "Q15-longdoc",
+      "query": "Which university is the offline multimodal RAG mini-project submitted to?",
+      "query_modality": "text",
+      "expected_sources": [
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [
+        "Presidency University"
+      ],
+      "tags": [
+        "long-document",
+        "cross-corpus"
+      ],
+      "notes": "Page 1 of the 22-item academic deck: 'Submitted to the Presidency University, Bengaluru'. That deck is the largest source in the corpus and shares no vocabulary with Project Alpha, so this measures whether it can still be reached."
+    },
+    {
+      "id": "Q16-paper-limitation",
+      "query": "What limitation of text-centric retrieval does the mini-project paper identify?",
+      "query_modality": "text",
+      "expected_sources": [
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "expected_modality": "text",
+      "expect_abstention": false,
+      "answer_keywords": [],
+      "keyword_alternatives": [
+        [
+          "attribution",
+          "page-level",
+          "timestamp-level",
+          "visual",
+          "audiovisual",
+          "images and audio"
+        ]
+      ],
+      "tags": [
+        "long-document",
+        "cross-corpus",
+        "open-ended"
+      ],
+      "notes": "Page 3 gives two related criticisms of text-centric retrieval: answers 'often lack accurate page-level, document-level or timestamp-level source attribution', and text-only retrieval ignores visual and audiovisual material. Either is a correct answer, so both are accepted through keyword_alternatives. Blaming cloud dependency is not: that is a different criticism the deck makes about generative AI in general."
     }
   ]
 }

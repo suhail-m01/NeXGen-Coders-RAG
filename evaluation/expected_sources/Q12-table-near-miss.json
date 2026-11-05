@@ -1,0 +1,7 @@
+{
+  "id": "Q12-table-near-miss",
+  "expected_sources": [
+    "project_metrics.csv"
+  ],
+  "expected_modality": "text"
+}

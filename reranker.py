@@ -62,6 +62,17 @@ class Reranker:
         pairs = [(query, r.item.content) for r in results]
         scores = get_model().predict(pairs, show_progress_bar=False)
 
+        # Length normalisation: cross-encoders mildly prefer long chunks, so
+        # chunks over the threshold take a fixed penalty. Off by config when
+        # rerank_length_norm is False, in which case scores pass through.
+        threshold = settings.rerank_length_threshold_chars
+        penalty = settings.rerank_length_penalty
+        scores = [
+            float(score) - (penalty if len(text) > threshold else 0.0)
+            if settings.rerank_length_norm else float(score)
+            for (_, text), score in zip(pairs, scores)
+        ]
+
         ordered = sorted(
             zip(results, scores),
             key=lambda pair: float(pair[1]),

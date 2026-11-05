@@ -1,0 +1,857 @@
+{
+  "dataset_version": "2.0",
+  "timestamp": "2026-11-05T13:46:35.565970+00:00",
+  "git_commit": "39c7d52",
+  "models": {
+    "llm": "qwen2.5:0.5b",
+    "embedding": "sentence-transformers/all-MiniLM-L6-v2",
+    "reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "whisper": "base (cpu/int8)"
+  },
+  "configuration": {
+    "top_k": 10,
+    "rerank_top_k": 5,
+    "chunk_size": 800,
+    "chunk_overlap": 100,
+    "related_to_threshold": 0.7,
+    "citation_threshold": 0.35,
+    "abstention_threshold": -6.0,
+    "abstention_threshold_image": -9.0,
+    "coverage_guard_enabled": true,
+    "numeric_guard_enabled": true,
+    "ocr_confidence_enabled": true,
+    "ocr_min_word_confidence": 40.0,
+    "ocr_min_digit_confidence": 60.0,
+    "hybrid_enabled": true,
+    "mmr_enabled": true,
+    "diarization_enabled": true,
+    "streaming_enabled": true,
+    "max_context_items": 5,
+    "temperature": 0.0,
+    "seed": 42,
+    "num_ctx": 4096
+  },
+  "index": {
+    "sources": 6,
+    "items": 37,
+    "relationships": 43,
+    "vectors": 37,
+    "by_modality": {
+      "audio": 2,
+      "image": 1,
+      "text": 34
+    },
+    "index_path": "/home/user/Multi-Modal-RAG/index/faiss.index",
+    "db_path": "/home/user/Multi-Modal-RAG/index/store.db"
+  },
+  "aggregate": {
+    "retrieval_precision": 0.3115,
+    "retrieval_recall": 0.9635,
+    "mrr": 0.6146,
+    "citation_accuracy": 0.4135,
+    "answer_correctness": 0.8125,
+    "groundedness": 0.9375,
+    "hallucination_rate": 0.0625,
+    "abstention_accuracy": 0.875,
+    "numeric_guard_rate": 0.0,
+    "forbidden_leak_rate": 0.1875,
+    "mean_latency_s": 6.575
+  },
+  "per_modality": {
+    "audio": {
+      "queries": 2,
+      "answer_correctness": 1.0,
+      "citation_accuracy": 0.1666,
+      "retrieval_recall": 1.0,
+      "groundedness": 1.0,
+      "abstention_accuracy": 1.0,
+      "forbidden_leak_rate": 0.0,
+      "pass_rate": 1.0
+    },
+    "image": {
+      "queries": 2,
+      "answer_correctness": 1.0,
+      "citation_accuracy": 0.25,
+      "retrieval_recall": 1.0,
+      "groundedness": 1.0,
+      "abstention_accuracy": 1.0,
+      "forbidden_leak_rate": 0.0,
+      "pass_rate": 1.0
+    },
+    "mixed": {
+      "queries": 1,
+      "answer_correctness": 0.0,
+      "citation_accuracy": 0.75,
+      "retrieval_recall": 0.75,
+      "groundedness": 1.0,
+      "abstention_accuracy": 1.0,
+      "forbidden_leak_rate": 0.0,
+      "pass_rate": 0.0
+    },
+    "none": {
+      "queries": 3,
+      "answer_correctness": 1.0,
+      "citation_accuracy": 0.3333,
+      "retrieval_recall": 1.0,
+      "groundedness": 1.0,
+      "abstention_accuracy": 0.3333,
+      "forbidden_leak_rate": 0.6667,
+      "pass_rate": 0.3333
+    },
+    "text": {
+      "queries": 8,
+      "answer_correctness": 0.75,
+      "citation_accuracy": 0.5042,
+      "retrieval_recall": 0.9583,
+      "groundedness": 0.875,
+      "abstention_accuracy": 1.0,
+      "forbidden_leak_rate": 0.125,
+      "pass_rate": 0.75
+    }
+  },
+  "dataset_coverage": {
+    "queries": 16,
+    "by_expected_modality": {
+      "audio": 2,
+      "image": 2,
+      "mixed": 1,
+      "none": 3,
+      "text": 8
+    },
+    "by_tag": {
+      "absent-figure": 1,
+      "adversarial": 4,
+      "asr": 2,
+      "cross-corpus": 2,
+      "cross-modal": 1,
+      "entity-confusion": 1,
+      "known-hard": 1,
+      "long-document": 2,
+      "modality:audio": 2,
+      "modality:image": 2,
+      "multi-hop": 2,
+      "near-miss-number": 1,
+      "near-miss-year": 1,
+      "ocr": 2,
+      "open-ended": 1,
+      "out-of-range": 1,
+      "single-hop": 2,
+      "synthesis": 1,
+      "table+prose": 1,
+      "table-fidelity": 1
+    },
+    "sources_covered": [
+      "MCA_MP_58-mini-project.pdf",
+      "project_dashboard.png",
+      "project_meeting.wav",
+      "project_metrics.csv",
+      "project_notes.docx",
+      "project_report.pdf"
+    ]
+  },
+  "per_query": [
+    {
+      "id": "Q1-pdf",
+      "query": "How many records did the ingestion platform process in 2024?",
+      "expected_sources": [
+        "project_report.pdf"
+      ],
+      "retrieved_sources": [
+        "project_meeting.wav",
+        "project_report.pdf",
+        "project_notes.docx",
+        "project_metrics.csv"
+      ],
+      "citation_sources": [
+        "project_meeting.wav",
+        "project_report.pdf",
+        "project_notes.docx",
+        "project_metrics.csv",
+        "project_metrics.csv"
+      ],
+      "modalities": [
+        "audio",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.25,
+      "recall": 1.0,
+      "mrr": 0.5,
+      "citation_accuracy": 0.2,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "text",
+      "tags": [
+        "single-hop"
+      ],
+      "notes": "Report p.2: 'During 2024 the ingestion platform processed 1.2 million records'.",
+      "confidence": 0.9999397655576706,
+      "latency_s": 23.16,
+      "answer": "2024 Development Results During 2024 the ingestion platform processed 1.2 million records, exceeding the annual target of one million."
+    },
+    {
+      "id": "Q2-docx",
+      "query": "What is the top open risk carried into 2025?",
+      "expected_sources": [
+        "project_notes.docx",
+        "project_report.pdf"
+      ],
+      "retrieved_sources": [
+        "project_notes.docx",
+        "project_report.pdf",
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "citation_sources": [
+        "project_notes.docx",
+        "project_report.pdf"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.6667,
+      "recall": 1.0,
+      "mrr": 1.0,
+      "citation_accuracy": 1.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "text",
+      "tags": [
+        "single-hop"
+      ],
+      "notes": "Notes, 'Open Risks': batch pipeline latency under peak load is the top risk carried into 2025.",
+      "confidence": 0.9995137334720672,
+      "latency_s": 10.83,
+      "answer": "Batch pipeline latency under peak load remains the top open risk carried into 2025."
+    },
+    {
+      "id": "Q3-image",
+      "query": "What does the project dashboard show about team size?",
+      "expected_sources": [
+        "project_dashboard.png"
+      ],
+      "retrieved_sources": [
+        "project_dashboard.png",
+        "project_report.pdf",
+        "project_notes.docx",
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "citation_sources": [
+        "project_dashboard.png",
+        "project_report.pdf"
+      ],
+      "modalities": [
+        "image",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.25,
+      "recall": 1.0,
+      "mrr": 1.0,
+      "citation_accuracy": 0.5,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "image",
+      "tags": [
+        "modality:image",
+        "ocr"
+      ],
+      "notes": "Dashboard tile 'Team size / 6 engineers'. At native resolution OCR fused adjacent glyphs and produced '22024'; the 2x upscale plus digit-confidence rule is what makes this answerable.",
+      "confidence": 0.0403248586976756,
+      "latency_s": 2.34,
+      "answer": "The project dashboard shows that the team size for Project Alpha in 2024 was 6 engineers."
+    },
+    {
+      "id": "Q4-audio",
+      "query": "What did the quarterly review recording say about accuracy?",
+      "expected_sources": [
+        "project_meeting.wav"
+      ],
+      "retrieved_sources": [
+        "project_meeting.wav",
+        "project_notes.docx",
+        "project_metrics.csv",
+        "project_dashboard.png"
+      ],
+      "citation_sources": [
+        "project_meeting.wav",
+        "project_notes.docx",
+        "project_metrics.csv",
+        "project_metrics.csv",
+        "project_metrics.csv",
+        "project_meeting.wav"
+      ],
+      "modalities": [
+        "audio",
+        "image",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.25,
+      "recall": 1.0,
+      "mrr": 1.0,
+      "citation_accuracy": 0.3333,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "audio",
+      "tags": [
+        "modality:audio",
+        "asr"
+      ],
+      "notes": "Transcript segment 1: 'classification accuracy reached 99.4%'.",
+      "confidence": 0.8975683350840421,
+      "latency_s": 11.38,
+      "answer": "Speaker 1 This is the Project Alpha Quarterly Review for 2024. The ingestion platform processed 1.2 million records this year. Our classification accuracy reached 99.4%, which is above the target we set in the first quarter. Budget utilization time at 87%."
+    },
+    {
+      "id": "Q5-crossmodal",
+      "query": "What evidence do we have about Project Alpha's 2024 development?",
+      "expected_sources": [
+        "project_report.pdf",
+        "project_dashboard.png",
+        "project_meeting.wav",
+        "project_notes.docx"
+      ],
+      "retrieved_sources": [
+        "project_report.pdf",
+        "MCA_MP_58-mini-project.pdf",
+        "project_meeting.wav",
+        "project_notes.docx"
+      ],
+      "citation_sources": [
+        "project_report.pdf",
+        "project_report.pdf",
+        "MCA_MP_58-mini-project.pdf",
+        "project_meeting.wav",
+        "project_notes.docx",
+        "project_notes.docx",
+        "MCA_MP_58-mini-project.pdf",
+        "project_report.pdf"
+      ],
+      "modalities": [
+        "audio",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.75,
+      "recall": 0.75,
+      "mrr": 1.0,
+      "citation_accuracy": 0.75,
+      "answer_correctness": 0.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "mixed",
+      "tags": [
+        "cross-modal",
+        "synthesis"
+      ],
+      "notes": "Deliberately broad: every Project Alpha source is relevant. This is the query that measures synthesis rather than lookup -- a 0.5b model tends to copy the first evidence block instead of combining two figures.",
+      "confidence": 0.9848624913339337,
+      "latency_s": 7.15,
+      "answer": "Project Alpha - Annual Report 2024 SYNTHETIC DEMO DATA - Project Alpha (fictional). Project Alpha is an internal data platform initiative launched in 2023 to consolidate records processing across departments. This report covers the 2024 development cycle, including delivery milestones, accuracy results, budget utilisation and outstanding technical risks. The programme is governed by a steering committee that meets quarterly."
+    },
+    {
+      "id": "Q6-unanswerable",
+      "query": "What was Project Alpha's budget in 2040?",
+      "expected_sources": [],
+      "retrieved_sources": [
+        "project_report.pdf",
+        "project_meeting.wav",
+        "project_notes.docx",
+        "project_dashboard.png"
+      ],
+      "citation_sources": [],
+      "modalities": [
+        "audio",
+        "image",
+        "text"
+      ],
+      "abstained": true,
+      "expect_abstention": true,
+      "abstention_correct": true,
+      "precision": 0.0,
+      "recall": 1.0,
+      "mrr": 0.0,
+      "citation_accuracy": 1.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "none",
+      "tags": [
+        "adversarial",
+        "out-of-range"
+      ],
+      "notes": "No 2040 anything exists in the corpus.",
+      "confidence": 0.9274664598720558,
+      "latency_s": 0.36,
+      "answer": "I found no evidence covering 2040 in the available sources, so I will not guess."
+    },
+    {
+      "id": "Q7-multihop-budget",
+      "query": "Which quarter used the most budget, and what explanation did finance ask for?",
+      "expected_sources": [
+        "project_metrics.csv",
+        "project_notes.docx",
+        "project_report.pdf"
+      ],
+      "retrieved_sources": [
+        "project_notes.docx",
+        "project_report.pdf",
+        "project_metrics.csv",
+        "project_meeting.wav",
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "citation_sources": [
+        "project_notes.docx",
+        "project_report.pdf",
+        "project_metrics.csv",
+        "project_meeting.wav",
+        "project_metrics.csv",
+        "project_notes.docx"
+      ],
+      "modalities": [
+        "audio",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.6,
+      "recall": 1.0,
+      "mrr": 1.0,
+      "citation_accuracy": 0.8333,
+      "answer_correctness": 1.0,
+      "groundedness": 0.0,
+      "hallucinated_numbers": [
+        "000",
+        "240"
+      ],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "text",
+      "tags": [
+        "multi-hop",
+        "table+prose"
+      ],
+      "notes": "Hop 1 is a table maximum: budget_used_pct peaks at 87 in the Q4 2024 CSV row. Hop 2 is prose: the notes say finance asked for a written explanation of the infrastructure underspend, and report p.3 says the underspend was concentrated in infrastructure. Neither source alone answers the question.",
+      "confidence": 0.6558813570933412,
+      "latency_s": 9.35,
+      "answer": "Q4 2024: 240,000 records processed, accuracy at 99.4%, budget used at 87%, infrastructure underspend."
+    },
+    {
+      "id": "Q8-multihop-milestones",
+      "query": "In which quarter was the NLP module deployed, and how many milestones were completed in that quarter?",
+      "expected_sources": [
+        "project_notes.docx",
+        "project_metrics.csv",
+        "project_dashboard.png"
+      ],
+      "retrieved_sources": [
+        "project_meeting.wav",
+        "project_notes.docx",
+        "project_report.pdf",
+        "project_dashboard.png",
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "citation_sources": [
+        "project_meeting.wav"
+      ],
+      "modalities": [
+        "audio",
+        "image",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.4,
+      "recall": 0.6667,
+      "mrr": 0.5,
+      "citation_accuracy": 0.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "text",
+      "tags": [
+        "multi-hop"
+      ],
+      "notes": "Hop 1 identifies Q2 2024 (dashboard tile, notes table, audio 'second quarter of 2024'). Hop 2 counts that quarter's milestones: 4, in both the CSV row and the notes table. '4' is a weak keyword on its own, which is why it is paired with 'Q2'.",
+      "confidence": 0.9971066025857159,
+      "latency_s": 0.85,
+      "answer": "Q2 2024"
+    },
+    {
+      "id": "Q9-adversarial-year",
+      "query": "How many records did the ingestion platform process in 2023?",
+      "expected_sources": [],
+      "retrieved_sources": [
+        "project_meeting.wav",
+        "project_report.pdf",
+        "project_notes.docx",
+        "project_metrics.csv"
+      ],
+      "citation_sources": [
+        "project_meeting.wav",
+        "project_report.pdf",
+        "project_notes.docx",
+        "project_metrics.csv",
+        "project_report.pdf",
+        "project_metrics.csv"
+      ],
+      "modalities": [
+        "audio",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": true,
+      "abstention_correct": false,
+      "precision": 0.0,
+      "recall": 1.0,
+      "mrr": 0.0,
+      "citation_accuracy": 0.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [
+        "1.2 million"
+      ],
+      "expected_modality": "none",
+      "tags": [
+        "adversarial",
+        "near-miss-year"
+      ],
+      "notes": "2023 appears in the corpus exactly once, as the launch year (report p.1). Every record count belongs to 2024. Answering with the 2024 figure means the system matched the topic and ignored the constraint.",
+      "confidence": 0.9999076334072726,
+      "latency_s": 7.74,
+      "answer": "2024 Development Results During 2024 the ingestion platform processed 1.2 million records, exceeding the annual target of one million."
+    },
+    {
+      "id": "Q10-absent-figure",
+      "query": "What was Project Alpha's total budget in US dollars?",
+      "expected_sources": [
+        "project_report.pdf",
+        "project_notes.docx"
+      ],
+      "retrieved_sources": [
+        "project_meeting.wav",
+        "project_report.pdf",
+        "project_notes.docx",
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "citation_sources": [
+        "project_meeting.wav"
+      ],
+      "modalities": [
+        "audio",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.5,
+      "recall": 1.0,
+      "mrr": 0.5,
+      "citation_accuracy": 0.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "text",
+      "tags": [
+        "adversarial",
+        "absent-figure"
+      ],
+      "notes": "The corpus gives utilisation as a percentage (87 percent of the allocated amount) and never an absolute sum. The correct answer reports the percentage and says no dollar figure is stated; must_not_contain catches a system that manufactures one.",
+      "confidence": 0.5959354473266812,
+      "latency_s": 9.31,
+      "answer": "87%"
+    },
+    {
+      "id": "Q11-entity-confusion",
+      "query": "How many engineers were on the Project Beta team?",
+      "expected_sources": [],
+      "retrieved_sources": [
+        "project_report.pdf",
+        "MCA_MP_58-mini-project.pdf",
+        "project_notes.docx"
+      ],
+      "citation_sources": [
+        "project_report.pdf"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": true,
+      "abstention_correct": false,
+      "precision": 0.0,
+      "recall": 1.0,
+      "mrr": 0.0,
+      "citation_accuracy": 0.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [
+        "6"
+      ],
+      "expected_modality": "none",
+      "tags": [
+        "adversarial",
+        "entity-confusion",
+        "known-hard"
+      ],
+      "notes": "There is no Project Beta. Marked known-hard on purpose: the numeric guard checks figures against evidence but nothing checks entity names, so the six-engineer fact will probably be served up for Beta -- a first run answered simply '6'. The bare number is forbidden too, because 'Project Beta had 6' is the same leak in fewer words. This query records the gap instead of hiding it.",
+      "confidence": 0.1658420143424039,
+      "latency_s": 0.72,
+      "answer": "6"
+    },
+    {
+      "id": "Q12-table-near-miss",
+      "query": "According to the metrics table, what was the classification accuracy in Q3 2024?",
+      "expected_sources": [
+        "project_metrics.csv"
+      ],
+      "retrieved_sources": [
+        "project_report.pdf",
+        "project_metrics.csv",
+        "project_notes.docx",
+        "project_dashboard.png"
+      ],
+      "citation_sources": [
+        "project_report.pdf"
+      ],
+      "modalities": [
+        "image",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.25,
+      "recall": 1.0,
+      "mrr": 0.5,
+      "citation_accuracy": 0.0,
+      "answer_correctness": 0.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [
+        "99.4"
+      ],
+      "expected_modality": "text",
+      "tags": [
+        "table-fidelity",
+        "near-miss-number"
+      ],
+      "notes": "CSV row 3 says 99.0 for Q3 2024. The adjacent Q4 row says 99.4, and 99.4 also appears in the report, the notes, the dashboard and the recording. Answering 99.4 means salience beat the row that was asked for.",
+      "confidence": 0.9913213849217335,
+      "latency_s": 0.68,
+      "answer": "99.4%"
+    },
+    {
+      "id": "Q13-image-deployment",
+      "query": "According to the dashboard image, when was the NLP module deployed?",
+      "expected_sources": [
+        "project_dashboard.png"
+      ],
+      "retrieved_sources": [
+        "project_notes.docx",
+        "project_dashboard.png",
+        "MCA_MP_58-mini-project.pdf",
+        "project_meeting.wav",
+        "project_report.pdf"
+      ],
+      "citation_sources": [
+        "project_notes.docx"
+      ],
+      "modalities": [
+        "audio",
+        "image",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.2,
+      "recall": 1.0,
+      "mrr": 0.5,
+      "citation_accuracy": 0.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "image",
+      "tags": [
+        "modality:image",
+        "ocr"
+      ],
+      "notes": "Dashboard tile 'NLP module deployed / Q2 2024', read by OCR at 90.5% mean word confidence after adaptive upscaling.",
+      "confidence": 0.8715726609429982,
+      "latency_s": 1.37,
+      "answer": "Q2 2024"
+    },
+    {
+      "id": "Q14-audio-budget",
+      "query": "What did the quarterly review recording say about budget utilisation?",
+      "expected_sources": [
+        "project_meeting.wav"
+      ],
+      "retrieved_sources": [
+        "project_notes.docx",
+        "project_report.pdf",
+        "project_meeting.wav",
+        "project_metrics.csv",
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "citation_sources": [
+        "project_notes.docx",
+        "project_report.pdf",
+        "project_metrics.csv"
+      ],
+      "modalities": [
+        "audio",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.2,
+      "recall": 1.0,
+      "mrr": 0.3333,
+      "citation_accuracy": 0.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "audio",
+      "tags": [
+        "modality:audio",
+        "asr"
+      ],
+      "notes": "Whisper renders the line as 'Budget utilization time at 87%' -- the verb is wrong, the figure is right -- so the keyword is the number rather than the sentence.",
+      "confidence": 0.9560289918053352,
+      "latency_s": 8.77,
+      "answer": "The quarterly review recording stated that budget utilisation for the 2024 financial year closed at 87 percent of the allocated amount."
+    },
+    {
+      "id": "Q15-longdoc",
+      "query": "Which university is the offline multimodal RAG mini-project submitted to?",
+      "expected_sources": [
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "retrieved_sources": [
+        "MCA_MP_58-mini-project.pdf",
+        "project_report.pdf",
+        "project_meeting.wav"
+      ],
+      "citation_sources": [
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "modalities": [
+        "audio",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.3333,
+      "recall": 1.0,
+      "mrr": 1.0,
+      "citation_accuracy": 1.0,
+      "answer_correctness": 1.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "text",
+      "tags": [
+        "long-document",
+        "cross-corpus"
+      ],
+      "notes": "Page 1 of the 22-item academic deck: 'Submitted to the Presidency University, Bengaluru'. That deck is the largest source in the corpus and shares no vocabulary with Project Alpha, so this measures whether it can still be reached.",
+      "confidence": 0.9913896800846101,
+      "latency_s": 2.3,
+      "answer": "Source: MCA_MP_58-mini-project.pdf\nUniversity: Presidency University"
+    },
+    {
+      "id": "Q16-paper-limitation",
+      "query": "What limitation of text-centric retrieval does the mini-project paper identify?",
+      "expected_sources": [
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "retrieved_sources": [
+        "MCA_MP_58-mini-project.pdf",
+        "project_dashboard.png",
+        "project_report.pdf"
+      ],
+      "citation_sources": [
+        "MCA_MP_58-mini-project.pdf",
+        "MCA_MP_58-mini-project.pdf",
+        "MCA_MP_58-mini-project.pdf",
+        "MCA_MP_58-mini-project.pdf",
+        "MCA_MP_58-mini-project.pdf"
+      ],
+      "modalities": [
+        "image",
+        "text"
+      ],
+      "abstained": false,
+      "expect_abstention": false,
+      "abstention_correct": true,
+      "precision": 0.3333,
+      "recall": 1.0,
+      "mrr": 1.0,
+      "citation_accuracy": 1.0,
+      "answer_correctness": 0.0,
+      "groundedness": 1.0,
+      "hallucinated_numbers": [],
+      "unverified_numbers": [],
+      "forbidden_hits": [],
+      "expected_modality": "text",
+      "tags": [
+        "long-document",
+        "cross-corpus",
+        "open-ended"
+      ],
+      "notes": "Page 3 gives two related criticisms of text-centric retrieval: answers 'often lack accurate page-level, document-level or timestamp-level source attribution', and text-only retrieval ignores visual and audiovisual material. Either is a correct answer, so both are accepted through keyword_alternatives. Blaming cloud dependency is not: that is a different criticism the deck makes about generative AI in general.",
+      "confidence": 0.08613679944510727,
+      "latency_s": 8.89,
+      "answer": "The mini-project paper identifies a limitation of text-centric retrieval when it comes to handling heterogeneous local data sources. Specifically, it notes that most existing AI assistants rely on cloud services, continuous internet connectivity, and text-centric retrieval. The paper suggests that sending confidential or locally stored information to external cloud services creates privacy, security, and regulatory concerns. Additionally, the paper highlights that conventional RAG systems often fail to effectively understand and retrieve evidence from images, diagrams, scanned documents, audio, video, and structured files."
+    }
+  ],
+  "judge_note": "LLM judge not run. Pass --judge to add advisory judge columns.",
+  "determinism_note": "Retrieval, reranking, relationships and citations are deterministic. Generation runs at temperature 0.0 with a fixed seed (ollama_seed), which makes answer-level metrics reproducible run-to-run; set ollama_seed <= 0 to opt out and they become approximate again."
+}
