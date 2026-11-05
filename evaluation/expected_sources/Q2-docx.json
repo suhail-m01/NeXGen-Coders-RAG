@@ -1,0 +1,8 @@
+{
+  "id": "Q2-docx",
+  "expected_sources": [
+    "project_notes.docx",
+    "project_report.pdf"
+  ],
+  "expected_modality": "text"
+}

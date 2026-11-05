@@ -1,0 +1,10 @@
+{
+  "id": "Q5-crossmodal",
+  "expected_sources": [
+    "project_report.pdf",
+    "project_dashboard.png",
+    "project_meeting.wav",
+    "project_notes.docx"
+  ],
+  "expected_modality": "mixed"
+}
