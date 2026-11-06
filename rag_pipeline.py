@@ -23,6 +23,7 @@ Canonical query pipeline:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import threading
 import time
@@ -46,6 +47,29 @@ from schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 2026-11-06: instructions ABOUT an attached file ("explain this document",
+# "summarise the report") carry no retrieval signal - a cross-encoder scores
+# them at the floor against every passage, the attachment included - so they
+# are routed to an attachment-only context instead of the relevance race that
+# factual questions get (measured consequences in the step-2 comment of
+# _ground). Deliberately conservative: a factual question must NEVER match, or
+# the corpus would be switched off for it, while a missed instruction only
+# costs the old merge behaviour.
+ATTACHMENT_DIRECTED = re.compile(
+    r"(?:\b(?:explain|summaris\w+|summariz\w+|describ\w+|analys\w+|analyz\w+"
+    r"|review|interpret|outline)\s+(?:this|that|the|my|the\s+attached)\s+"
+    r"(?:attached|uploaded)?\s*(?:document|file|pdf|attachment|paper|report|image"
+    r"|photo|note|sheet|spreadsheet|slides?|deck|upload)s?\b)"
+    r"|(?:\b(?:tell|talk)\s+(?:me\s+)?about\s+(?:this|that|the|my)\s+"
+    r"(?:attached|uploaded)?\s*(?:document|file|pdf|attachment|paper|report|image"
+    r"|photo|note|sheet|spreadsheet|slides?|deck|upload)s?\b)"
+    r"|(?:\bwhat\s+(?:is|are|does|do|says?|is\s+in|are\s+in|contains?)\s+"
+    r"(?:this|that|the\s+attached|my)\s+"
+    r"(?:document|file|pdf|attachment|paper|report|image|photo|note|sheet"
+    r"|spreadsheet|slides?|deck|upload)s?\b)",
+    re.IGNORECASE,
+)
 
 ABSTENTION_MESSAGE = (
     "I could not find sufficient evidence in the available sources to "
@@ -432,6 +456,26 @@ class RAGPipeline:
             return
         yield from self._finish_stream(grounded)
 
+    def query_stream_attached(self, request: QueryRequest, attachment_evidence,
+                              attachment_filenames, backend=None):
+        """query_stream() with ephemeral attachment evidence in the pool.
+
+        Kept as its own funnel rather than a flag on query_stream so the
+        no-attachment path stays a two-line function that cannot drift: the
+        attachment arguments are positional evidence lists built by
+        attachments.extract_attachments, and every gate, guard and citation
+        downstream is shared verbatim.
+        """
+        grounded = self._ground(
+            request, backend,
+            attachment_evidence=attachment_evidence,
+            attachment_filenames=attachment_filenames,
+        )
+        if isinstance(grounded, QueryResponse):
+            yield self._observe(grounded)
+            return
+        yield from self._finish_stream(grounded)
+
     def query_retrieval_only(self, request: QueryRequest, backend=None) -> QueryResponse:
         """Steps 1-5b and no further: representation, retrieval, rerank, gates.
 
@@ -469,11 +513,20 @@ class RAGPipeline:
             latency_ms=state["timings"],
         ))
 
-    def _ground(self, request: QueryRequest, backend=None):
+    def _ground(self, request: QueryRequest, backend=None,
+                attachment_evidence=None, attachment_filenames=None):
         """Steps 1-5b: representation, retrieval, rerank, gates, evidence.
 
         Returns either a finished QueryResponse (invalid query, no evidence,
         abstention) or a state dict for _finish() to generate from.
+
+        `attachment_evidence` (a list of RetrievalResult built by
+        attachments.extract_attachments) joins the corpus candidates before
+        reranking, so an attached file competes for the context window on the
+        same cross-encoder scores as indexed material and passes through the
+        same gates; `attachment_filenames` supplies the upload names for
+        source ids the store does not know, because attachments are never
+        indexed.
         """
         from citations import build_citations
         from llm import pick_inspectable_image
@@ -529,14 +582,55 @@ class RAGPipeline:
         # 2. Retrieval. A file-based query excludes its own indexed source so
         # that "find sources related to this" returns other material rather
         # than the query file's own chunks.
-        mark = time.perf_counter()
-        excluded = self._self_source_ids(request)
-        retrieved = self.retriever.retrieve(
-            representation, top_k=request.top_k, exclude_source_ids=excluded,
-            collection=request.collection,
+        #
+        # 2026-11-06, measured three times on real uploads: attachment turns
+        # must be routed by what the question ASKS. The first build skipped the
+        # score gate for every attachment turn and pinned the attachment first:
+        # "What percentage of the budget was utilised?" then answered "50 %"
+        # from an attached scheme of examination that merely passes the
+        # criteria, while the corpus's 87 % block sat behind it in the same
+        # context. The second build ordered everything by relevance and let
+        # corpus blocks join when they cleared the abstention bar: an e2e
+        # "explain this document" turn then cited three corpus files and none
+        # of the attachment, because a cross-encoder scores an instruction at
+        # the floor against EVERY passage - the attachment included - so any
+        # corpus page scraping over the bar outranks the file the question is
+        # about. Neither signal is wrong; they suit different questions:
+        #   - an instruction ABOUT the attachment (explain/summarise/describe
+        #     this document) carries no retrieval signal at all, so the
+        #     attachment alone is the context and the corpus is not searched;
+        #   - a factual question produces real scores on both sides, so the
+        #     normal gate and relevance ordering decide, with the attachment
+        #     competing as an ordinary candidate.
+        # The coverage and entity guards below apply in both modes, and the
+        # synthesis prompt carries the attachment rules that keep the
+        # no-world-knowledge contract.
+        attachment_only = bool(
+            attachment_evidence
+            and ATTACHMENT_DIRECTED.search(request.query or "")
         )
-        timings["retrieval_ms"] = (time.perf_counter() - mark) * 1000
-        _count(retrieved=len(retrieved))
+
+        mark = time.perf_counter()
+        if attachment_only:
+            retrieved = list(attachment_evidence)
+            timings["retrieval_ms"] = (time.perf_counter() - mark) * 1000
+            _count(retrieved=0, attachment_chunks=len(retrieved))
+        else:
+            excluded = self._self_source_ids(request)
+            retrieved = self.retriever.retrieve(
+                representation, top_k=request.top_k, exclude_source_ids=excluded,
+                collection=request.collection,
+            )
+            timings["retrieval_ms"] = (time.perf_counter() - mark) * 1000
+            _count(retrieved=len(retrieved))
+
+            if attachment_evidence:
+                # Attached chunks join before reranking, never after: the
+                # cross-encoder decides whether the attachment or the corpus is
+                # what the question needs, and the abstention gate below sees
+                # the same scores either way.
+                retrieved = list(retrieved) + list(attachment_evidence)
+                _count(attachment_chunks=len(attachment_evidence))
 
         if not retrieved:
             return _refuse(
@@ -574,7 +668,57 @@ class RAGPipeline:
             else settings.abstention_threshold
         )
         _count(threshold=threshold)
-        if best_score < threshold:
+        if attachment_only:
+            # The context is the attached file by construction; a relevance
+            # verdict on an instruction query would be noise (see the routing
+            # comment in step 2).
+            _set_technical_detail(
+                "attachment-directed request: context is the attached file "
+                f"only ({len(reranked)} block(s) from "
+                f"{len({r.item.source_id for r in reranked})} file(s)); corpus "
+                "retrieval skipped - instruction queries score at the floor "
+                "against every passage"
+            )
+        elif attachment_evidence:
+            # A factual question asked with an attachment present: the score
+            # gate answers "is retrieval strong enough to answer?" and an
+            # attached file is read, not searched, so the gate does not get to
+            # refuse the turn the user just paid an upload for - but corpus
+            # blocks only join the context when they clear the same calibrated
+            # relevance bar a corpus-only search must clear (without this,
+            # weak pages bled into summaries: measured 2026-11-06, blockchain
+            # and an implementation plan appeared in a summary of a
+            # scheme-of-examination PDF). Ordering stays relevance-first: the
+            # attachment is exempt from the refuse/accept gate, not from
+            # ranking - pinning it to the front measured badly the other way
+            # round (2026-11-06: "what percentage of the budget was
+            # utilised?" answered 50 % from an attached scheme's passing
+            # criteria while the corpus's 87 % sat behind it).
+            attach_ids = {r.item.item_id for r in attachment_evidence}
+            attached = [r for r in reranked if r.item.item_id in attach_ids]
+            corpus = [r for r in reranked if r.item.item_id not in attach_ids]
+            if attached:
+                kept_corpus = [
+                    c for c in corpus
+                    if c.rerank_score >= (
+                        settings.abstention_threshold_image
+                        if c.item.modality == Modality.IMAGE
+                        else settings.abstention_threshold
+                    )
+                ]
+                reranked = sorted(
+                    attached + kept_corpus,
+                    key=lambda r: r.rerank_score,
+                    reverse=True,
+                )
+                _set_technical_detail(
+                    "attachment turn: score gate not applied to attached "
+                    f"evidence ({len(attached)} block(s) from "
+                    f"{len({r.item.source_id for r in attached})} file(s)); "
+                    f"{len(kept_corpus)} of {len(corpus)} corpus block(s) met "
+                    "the relevance bar; order is relevance-first"
+                )
+        elif best_score < threshold:
             return _refuse(
                 answer=ABSTENTION_MESSAGE,
                 retrieved_items=reranked,
@@ -595,6 +739,14 @@ class RAGPipeline:
                 if settings.chunking_mode.strip().lower() == "structure"
                 else None
             )
+            if attachment_evidence:
+                # The per-source cap exists so one corpus document cannot
+                # crowd out another modality. An attachment is the opposite
+                # case: it is the file the question was asked with, and its
+                # pages are one source by construction, so the cap would
+                # starve exactly the evidence the turn is about.
+                cap = max(cap or settings.mmr_max_per_source,
+                          len(attachment_evidence))
             reranked = mmr_select(
                 representation, reranked, request.rerank_top_k, max_per_source=cap
             )
@@ -719,6 +871,11 @@ class RAGPipeline:
                 )
 
         filenames = self.filenames_for(final_evidence)
+        if attachment_filenames:
+            # Attachment source ids are content hashes the store has never
+            # seen; filenames_for would label them "unknown", so the upload
+            # names travel with the evidence and win over the miss.
+            filenames = {**filenames, **attachment_filenames}
 
         return {
             "request": request,
@@ -731,6 +888,8 @@ class RAGPipeline:
             "relationships": relationships,
             "final_evidence": final_evidence,
             "filenames": filenames,
+            "attachment_turn": bool(attachment_evidence),
+            "attachment_only": attachment_only,
             "inspect_image": (
                 pick_inspectable_image(final_evidence)
                 if (request.inference_mode is InferenceMode.LOCAL_VISION
@@ -749,7 +908,8 @@ class RAGPipeline:
             state["final_evidence"],
             state["filenames"],
         )
-        kwargs = {"inspect_image": state["inspect_image"]}
+        kwargs = {"inspect_image": state["inspect_image"],
+                  "attachment_turn": state.get("attachment_turn", False)}
         if stream:
             return provider.generate_stream(*args, **kwargs)
         return provider.generate(*args, **kwargs)

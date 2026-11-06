@@ -114,6 +114,7 @@ class InferenceProvider(ABC):
         evidence: list[RerankedResult],
         filenames: dict[str, str],
         inspect_image: Path | None = None,
+        attachment_turn: bool = False,
     ) -> str:
         """Produce the answer text. Raises ProviderError on failure."""
 
@@ -123,13 +124,16 @@ class InferenceProvider(ABC):
         evidence: list[RerankedResult],
         filenames: dict[str, str],
         inspect_image: Path | None = None,
+        attachment_turn: bool = False,
     ):
         """Yield answer chunks. Default: one chunk holding the full answer.
 
         Providers that can stream natively override this; callers may always
         rely on the generator protocol either way.
         """
-        yield self.generate(query, evidence, filenames, inspect_image=inspect_image)
+        yield self.generate(query, evidence, filenames,
+                            inspect_image=inspect_image,
+                            attachment_turn=attachment_turn)
 
     @property
     @abstractmethod
@@ -183,12 +187,14 @@ class OllamaProvider(InferenceProvider):
         evidence: list[RerankedResult],
         filenames: dict[str, str],
         inspect_image: Path | None = None,
+        attachment_turn: bool = False,
     ) -> str:
         from llm import OllamaError, generate_answer
 
         try:
             return generate_answer(query, evidence, filenames,
-                                   inspect_image=inspect_image)
+                                   inspect_image=inspect_image,
+                                   attachment_turn=attachment_turn)
         except OllamaError as exc:
             raise ProviderError(
                 "Offline AI could not generate an answer.",
@@ -202,12 +208,14 @@ class OllamaProvider(InferenceProvider):
         evidence: list[RerankedResult],
         filenames: dict[str, str],
         inspect_image: Path | None = None,
+        attachment_turn: bool = False,
     ):
         from llm import OllamaError, generate_answer_stream
 
         try:
             yield from generate_answer_stream(
-                query, evidence, filenames, inspect_image=inspect_image
+                query, evidence, filenames, inspect_image=inspect_image,
+                attachment_turn=attachment_turn,
             )
         except OllamaError as exc:
             raise ProviderError(
@@ -331,6 +339,7 @@ class OpenAIProvider(InferenceProvider):
         evidence: list[RerankedResult],
         filenames: dict[str, str],
         inspect_image: Path | None = None,
+        attachment_turn: bool = False,
     ) -> str:
         # Same prompt builder as offline: identical grounding rules,
         # identical evidence formatting, identical abstention instruction.
@@ -343,7 +352,8 @@ class OpenAIProvider(InferenceProvider):
                 ErrorCode.OLLAMA_NOT_AVAILABLE,
             )
 
-        prompt = build_prompt(query, evidence, filenames)
+        prompt = build_prompt(query, evidence, filenames,
+                              attachment_turn=attachment_turn)
         payload = {
             "model": settings.online_model,
             "messages": self._build_messages(prompt, inspect_image),

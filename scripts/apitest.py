@@ -118,6 +118,22 @@ def main() -> int:
     from config import settings
 
     client = TestClient(api.app)
+
+    def unauthed(method, path, **kw):
+        """Probe with an empty cookie jar.
+
+        /login sets a HttpOnly session cookie as a second transport, and the
+        TestClient jar keeps it, so a "no credential" probe issued after any
+        login in this run would silently authenticate through the cookie and
+        assert the wrong thing. A probe that means "unauthenticated" has to
+        say so.
+        """
+        jar = client.cookies
+        client.cookies = type(jar)()
+        try:
+            return getattr(client, method)(path, **kw)
+        finally:
+            client.cookies = jar
     store = get_user_store()
     before = db_counts(settings.auth_db)
     index_before = index_state(settings.index_dir)
@@ -306,8 +322,8 @@ def main() -> int:
             check("the refusal says what to do instead",
                   "reindex" in (detail.get("hint") or ""), (detail.get("hint") or "")[:60])
             check("authentication is checked before the limit (401, not 429)",
-                  client.post("/query", json={"query": "x", "query_modality": "text"}
-                              ).status_code == 401)
+                  unauthed("post", "/query", json={"query": "x", "query_modality": "text"}
+                           ).status_code == 401)
             limiter.check("ingest", f"account:{username}")
             upload = client.post(
                 "/ingest", headers=headers,
@@ -373,7 +389,7 @@ def main() -> int:
               sorted(set(model_body) ^ {"reachable", "configured", "configured_present",
                                         "names", "installed", "hint"}))
         check("GET /models needs a token like every other read of service state",
-              client.get("/models").status_code == 401)
+              unauthed("get", "/models").status_code == 401)
         check("GET /models agrees with itself about whether the model is present",
               model_body.get("configured_present")
               == (model_body.get("configured") in (model_body.get("names") or [])),
@@ -383,6 +399,35 @@ def main() -> int:
               == (model_body.get("reachable") is True
                   and model_body.get("configured_present") is False),
               str(model_body.get("hint"))[:120])
+
+        # ---- attachments ----------------------------------------------------
+        # The paperclip's contract at the edge: who may attach, what a missing
+        # or unsupported upload reports. What an attachment becomes once
+        # extracted (evidence, citations, guards, ephemerality) is asserted by
+        # the end-to-end flow against a running service, because it needs the
+        # processors and the model rather than a test client.
+        attached = unauthed(
+            "post", "/query_attachment", data={"query": "what is this?"},
+            files=[("files", ("note.txt", b"hello", "text/plain"))],
+        )
+        check("an attachment needs a credential like any question",
+              attached.status_code == 401, attached.status_code)
+        no_files = client.post("/query_attachment", headers=headers,
+                               data={"query": "what is this?"})
+        detail = (no_files.json() or {}).get("detail") or {}
+        check("a question with no attachment is a 400 that names the field",
+              no_files.status_code == 400 and "files" in (detail.get("hint") or ""),
+              f"{no_files.status_code} {detail}")
+        bad_type = client.post(
+            "/query_attachment", headers=headers, data={"query": "what is this?"},
+            files=[("files", ("payload.exe", b"MZ", "application/octet-stream"))],
+        )
+        bad_detail = (bad_type.json() or {}).get("detail") or {}
+        check("an unsupported attachment is a 400 that lists what is accepted",
+              bad_type.status_code == 400
+              and "payload.exe" in (bad_detail.get("error") or "")
+              and ".pdf" in (bad_detail.get("error") or ""),
+              f"{bad_type.status_code} {str(bad_detail)[:120]}")
 
         # ---- collections ---------------------------------------------------
         # The invariant under test is the last one: deleting a collection moves

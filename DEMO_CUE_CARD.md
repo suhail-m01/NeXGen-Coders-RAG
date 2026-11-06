@@ -16,7 +16,7 @@ to install, what to say about each panel, what to do when something goes wrong �
 | 2 | Log in — or fill the same form to create the first administrator | The bootstrap door closes after one use; do not discover that live |
 | 3 | Ask **"What is the top risk carried into 2025?"** and let it finish | **A cold process takes 26 s** for the first answer while the model loads. Every answer after it is 8–13 s. The audience must never see the first one |
 | 4 | Leave the tab on **Ask**, zoom 100%, Streamlit open in a second tab | Beat 8 uses the operator UI |
-| 5 | If anything looks wrong: `scripts\selftest.py` (258 checks, no model), `scripts\apitest.py` (74), `scripts\dump_chunks.py --all` (6 sources) | All three are offline and take under a minute together |
+| 5 | If anything looks wrong: `scripts\selftest.py` (276 checks, no model), `scripts\apitest.py` (81), `scripts\dump_chunks.py --all` (6 sources) | All three are offline and take under a minute together |
 
 ---
 
@@ -131,8 +131,8 @@ whether the answer is right — correctness and abstention measure that, and bot
 The timings above were measured on 2026-11-06 against `EvidenceAI_Windows_Kit.zip`
 unpacked into a clean directory: `.env` copied from `.env.example`, index built from
 `data/` by `scripts\ingest_demo.py` in 28 s, seven questions through the ASGI app with
-the model resident. In the same tree afterwards: `selftest.py` 258/258, `apitest.py`
-78/78 on its first run against that fresh index, `smoke_test.py` 4/4, `verify_offline.py`
+the model resident. In the same tree afterwards: `selftest.py` 276/276, `apitest.py`
+81/81 on its first run against that fresh index, `smoke_test.py` 4/4, `verify_offline.py`
 PASSED, and `evaluation.py --compare` **16 PASS with 0 gated failures** — every one of the
 ten gated metrics identical to the report of record `report_20261106_000901`, with no
 per-query drift across the sixteen questions (`report_20261106_011329`, in

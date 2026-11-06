@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { api } from '../api.js'
+import { api, ApiError } from '../api.js'
 import Answer from './Answer.jsx'
 import Evidence from './Evidence.jsx'
 import StageTrace from './StageTrace.jsx'
@@ -33,8 +33,44 @@ export default function Ask({ can, focusSignal }) {
   // multi-turn conversation that is readable on the History tab afterwards.
   const [sessionId, setSessionId] = useState(null)
   const [record, setRecord] = useState(true)
+  // Files attached to the next question, ChatGPT-style. They stay File objects
+  // until send: nothing is uploaded before the question is asked, and the chips
+  // can be removed again for free. The server extracts them into ephemeral
+  // evidence for that one turn - they never join the index.
+  const [attached, setAttached] = useState([])
+  // What the answer on screen was asked with, captured at ask time like the
+  // scope, so removing a chip afterwards does not rewrite the answer's context.
+  const [askedWith, setAskedWith] = useState([])
   const answerRef = useRef(null)
   const questionRef = useRef(null)
+  const fileRef = useRef(null)
+
+  const MAX_ATTACHED = 5
+
+  function addFiles(incoming) {
+    setAttached((current) => {
+      const next = [...current]
+      const rejected = []
+      for (const file of incoming) {
+        if (next.length >= MAX_ATTACHED) {
+          rejected.push(file.name)
+          continue
+        }
+        if (next.some((f) => f.name === file.name && f.size === file.size)) continue
+        next.push(file)
+      }
+      if (rejected.length) {
+        setError(
+          new ApiError(
+            `At most ${MAX_ATTACHED} attachments may accompany one question; ` +
+              `not added: ${rejected.join(', ')}.`,
+            400,
+          ),
+        )
+      }
+      return next
+    })
+  }
 
   // Ctrl/Cmd+K anywhere in the app lands the cursor in the question box. The
   // signal is a counter rather than a ref handle because the box only exists
@@ -81,20 +117,33 @@ export default function Ask({ can, focusSignal }) {
     setStreamed('')
     setScope(collection)
     setAsked(trimmed)
+    setAskedWith(attached.map((f) => f.name))
+    const sending = attached
     try {
       // With recording on and no session yet, a placeholder id goes out: the API
       // starts a real session and returns its id, so no extra round trip is needed
-      // before the first question.
-      const payload = await api.queryStream(
-        trimmed,
-        collection,
-        record ? sessionId || 'new' : null,
-        (token) => setStreamed((soFar) => soFar + token),
-      )
+      // before the first question. With attachments the multipart route carries
+      // the same contract back, so streaming, citations and history behave
+      // identically either way.
+      const payload = sending.length
+        ? await api.queryAttachStream(
+            trimmed,
+            sending,
+            collection,
+            record ? sessionId || 'new' : null,
+            (token) => setStreamed((soFar) => soFar + token),
+          )
+        : await api.queryStream(
+            trimmed,
+            collection,
+            record ? sessionId || 'new' : null,
+            (token) => setStreamed((soFar) => soFar + token),
+          )
       setStreamed('')
       setResult(payload)
       if (payload.session_id) setSessionId(payload.session_id)
       setQuestion(trimmed)
+      setAttached([])
       if (answerRef.current) answerRef.current.scrollIntoView({ block: 'start' })
     } catch (err) {
       setResult(null)
@@ -115,6 +164,8 @@ export default function Ask({ can, focusSignal }) {
     setQuestion('')
     setActive(null)
     setError(null)
+    setAttached([])
+    setAskedWith([])
   }
 
   return (
@@ -149,6 +200,50 @@ export default function Ask({ can, focusSignal }) {
               }}
             />
           </label>
+
+          <div className="row" style={{ gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="ghost small"
+              disabled={busy}
+              onClick={() => fileRef.current?.click()}
+              title="Attach documents or images to the next question"
+            >
+              📎 Attach files
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              hidden
+              accept=".pdf,.doc,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp,.bmp,.tiff,.tif"
+              onChange={(e) => {
+                addFiles(Array.from(e.target.files || []))
+                e.target.value = ''
+              }}
+            />
+            {attached.map((file, index) => (
+              <span key={`${file.name}-${file.size}-${index}`} className="pill">
+                {file.name}
+                <button
+                  type="button"
+                  className="ghost small"
+                  disabled={busy}
+                  aria-label={`Remove ${file.name}`}
+                  onClick={() =>
+                    setAttached((current) => current.filter((_, j) => j !== index))
+                  }
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            <span className="muted small">
+              {attached.length
+                ? 'answered from these files and the corpus; attachments are not indexed'
+                : 'documents & images, up to 5 per question'}
+            </span>
+          </div>
 
           <div className="row spread">
             <div className="row">
@@ -252,6 +347,11 @@ export default function Ask({ can, focusSignal }) {
                 ? `scoped to ${scope}`
                 : 'searching every collection'}
             </span>
+            {askedWith.length ? (
+              <span className="pill ok" title={askedWith.join(', ')}>
+                with {askedWith.length} attachment{askedWith.length > 1 ? 's' : ''}
+              </span>
+            ) : null}
             <span className="pill">{asked}</span>
           </div>
           <Answer result={result} active={active} onSelect={setActive} can={can} />

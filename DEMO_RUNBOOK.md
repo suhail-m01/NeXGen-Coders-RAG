@@ -92,7 +92,7 @@ ingest, delete sources, manage collections, export history, manage accounts).
 ## 4. Verify before you walk in (2 minutes)
 
 ```powershell
-python scripts\selftest.py       # 258 offline checks: guards, collections, tables, context
+python scripts\selftest.py       # 276 offline checks: guards, collections, tables, context
 python scripts\apitest.py        # 78 offline checks: the API and the React UI
 python scripts\apitest.py --with-query   # 88 checks, including the streaming route
 python scripts\verify_env.py     # every import resolves, binaries reachable, audio decodes
@@ -106,16 +106,18 @@ Expected, all of it measured on this build (index 6 sources / 36 items / 41 rela
 
 | Command | Result | Exit |
 |---|---|---|
-| `scripts\selftest.py` | **258/258 checks passed** — no LLM, no network, throwaway index | 0 |
+| `scripts\selftest.py` | **276/276 checks passed** — no LLM, no network, throwaway index | 0 |
 | `scripts\verify_kit.py` | **10/10 checks** on the archive you installed from — run this first, on any machine, before the environment exists | 0 |
-| `scripts\apitest.py` | **78/78 checks** on the API and the React UI it serves — first-run bootstrap, login, roles, lockout, `/ui` assets, chat history, the 429 path, manifest, collections, and a final assertion that the accounts, the history and the index are exactly as the suite found them. No server, no model | 0 |
+| `scripts\apitest.py` | **81/81 checks** on the API and the React UI it serves — first-run bootstrap, login, roles, lockout, `/ui` assets, chat history, the 429 path, manifest, collections, and a final assertion that the accounts, the history and the index are exactly as the suite found them. No server, no model | 0 |
 | `scripts\verify_env.py` | `Environment verified - all required imports succeeded` (pyttsx3 optional) | 0 |
 | `scripts\smoke_test.py` | **4/4** questions answered, abstention correct | 0 |
 | `scripts\dump_chunks.py --all` | 6 indexed sources with their chunk counts — the fastest way to confirm the index is the corpus you think it is | 0 |
 | `scripts\verify_offline.py` | `none - every socket stayed on loopback` → `Offline verification PASSED` | 0 |
 | `evaluation.py --retrieval-only --compare` | **15 PASS / 0 CHECK / 1 UNDECIDED** in 33 s, retrieval metrics identical to the full run. The undecided row is Q9, whose refusal comes from the post-generation temporal guard — reported, not guessed | 0 |
-| Fresh install from this archive | unpacked into a clean directory, `.env` copied from `.env.example`, index built by `ingest_demo.py` in **28 s**: `verify_kit.py` **12/12** with `--extract`, `selftest.py` **258/258**, `apitest.py` **78/78 on its first run against that index**, `smoke_test.py` **4/4**, `verify_offline.py` PASSED, and `evaluation.py --compare` **16 PASS / 0 gated failures** with **all ten gated metrics identical** to `report_20261106_000901` (`report_20261106_011329`). Latency differs and should: 10.69 s mean with the model resident, against 15.77 s in the record where `OLLAMA_KEEP_ALIVE=0` unloaded it between questions |
+| Fresh install from this archive | unpacked into a clean directory, `.env` copied from `.env.example`, index built by `ingest_demo.py` in **28 s**: `verify_kit.py` **12/12** with `--extract`, `selftest.py` **276/276**, `apitest.py` **81/81 on its first run against that index**, `smoke_test.py` **4/4**, `verify_offline.py` PASSED, and `evaluation.py --compare` **16 PASS / 0 gated failures** with **all ten gated metrics identical** to `report_20261106_000901` (`report_20261106_011329`). Latency differs and should: 10.69 s mean with the model resident, against 15.77 s in the record where `OLLAMA_KEEP_ALIVE=0` unloaded it between questions |
 | `evaluation.py --compare` after round 3 | exit 0 — **16 PASS / 0 CHECK**, 0 gated failures, clean tree at `09caf60`, and **every gated metric identical** to `report_20261106_000901`. The streaming route changed when tokens arrive, not what the answer is (`report_20261106_014909`) |
+| `evaluation.py --compare` after the attachments feature | exit 0 — **16 PASS / 0 CHECK**, 0 gated failures, clean tree at `a798d97`: attachment evidence joins the shared rerank → guards → synthesis path, and **every gated metric is identical** to `report_20261106_000901` with zero per-query drift (`report_20261106_032714`) |
+| `evaluation.py --compare` after the attachment routing fix | exit 0 — **16 PASS / 0 CHECK**, 0 gated failures, clean tree at `e781e49`: “explain this document” and its kin are answered from the attachment alone, factual questions keep the shared corpus path unchanged, and **every gated metric is identical** to `report_20261106_000901` with zero per-query drift — mean latency 16.24 s against the record's 15.77 s is the usual `OLLAMA_KEEP_ALIVE=0` jitter (`report_20261106_043956`) |
 | `evaluation.py --compare` | **16 PASS / 0 CHECK** on dataset v2.0, `PASS: no gated metric regressed`, retrieval precision 0.3531, citation accuracy 0.5635, no per-query regression to report (report `report_20261106_000901`, commit `1fac077`, clean tree) | 0 |
 
 `selftest.py` is the one to run in the room if a laptop has not finished downloading

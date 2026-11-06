@@ -187,7 +187,39 @@ python scripts/manifest.py --json              # the build you are about to ship
   Only set `RATE_LIMIT_TRUST_FORWARDED_FOR=true` behind a proxy you control — it makes
   the rightmost `X-Forwarded-For` hop the client, and any client can write the rest of
   that header.
-- The React UI stores its bearer token in `localStorage` and calls `POST /logout`
-  on sign-out, which revokes the token server-side rather than only forgetting it.
+- The React UI keeps its bearer token in memory while the page lives and mirrors
+  it to `localStorage` as a reload bridge where the browser allows storage.
+  Sandboxed embed viewers - iframes without `allow-same-origin`, which is how
+  preview panes ship a running app - make every storage call throw; there,
+  memory carries the session instead of degrading every data call to a 401.
+- Sign-out calls `POST /logout`, which revokes the token server-side and clears
+  the session cookie rather than only forgetting it in the browser.
+- The server accepts the token on four transports, in order: the
+  `Authorization: Bearer` header, an `X-EAI-Token` header, the HttpOnly
+  `eai_session` cookie that `/login` sets, and an `access_token` query
+  parameter. The last three exist because reverse proxies and embed viewers
+  are known to strip `Authorization`; the UI switches to the query parameter
+  only after it observes a header attempt being dropped, since a token in a
+  URL can land in proxy logs. Whichever transport served a request is logged
+  at INFO, so a 401 in the wild is diagnosable from the server log.
+- Attachments (`POST /query_attachment`) accept up to five documents or images per
+  question, each within `max_file_bytes`. They are extracted into ephemeral evidence
+  for that turn only - never indexed, never persisted - and flow through the same
+  coverage and entity guards, abstention semantics and citation building as indexed
+  material, so an attachment cannot buy an unguarded answer. Audio is deliberately
+  excluded: transcription belongs to the ingest queue with its own rate bucket, not
+  to a chat round trip. The turn is then routed by what the question asks. An
+  instruction about the attachment itself - "explain this document", "summarise the
+  report" - is answered from the attachment alone: a cross-encoder scores an
+  instruction at the floor against every passage including the attachment, so a
+  relevance race would be noise, and corpus pages scraping over the abstention bar
+  measurably bled into such summaries. A factual question keeps the normal
+  semantics with the attachment as an ordinary candidate: the score gate may not
+  refuse the turn on attached evidence, corpus blocks join only above the
+  per-modality relevance bar, and the merged context is ordered relevance-first,
+  because pinning the attachment to the front measurably answered a corpus fact
+  (87 % budget utilisation) from an attached scheme's passing criteria (50 %). The
+  per-source diversity cap relaxes on attachment turns, because the attached file
+  is one source by construction.
   That is normal for a browser app and worth knowing: on a shared machine, sign
   out rather than closing the tab.

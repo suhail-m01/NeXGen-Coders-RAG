@@ -42,10 +42,10 @@ Short version, in PowerShell:
        API docs ->  http://127.0.0.1:8000/docs
 
     Checks, any time (cheapest first):
-       .venv\Scripts\python scripts\selftest.py         258 checks, no model/network
+       .venv\Scripts\python scripts\selftest.py         271 checks, no model/network
        .venv\Scripts\python scripts\verify_kit.py       10 checks on this archive
                                                           (RECOVERY.md if one fails)
-       .venv\Scripts\python scripts\apitest.py          78 checks on the API + React UI
+       .venv\Scripts\python scripts\apitest.py          81 checks on the API + React UI
        .venv\Scripts\python scripts\verify_env.py       environment
        .venv\Scripts\python scripts\smoke_test.py       real Q&A with citations
        .venv\Scripts\python scripts\verify_offline.py   proves no internet needed

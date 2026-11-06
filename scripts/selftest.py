@@ -1374,6 +1374,155 @@ def test_kit_verifier() -> None:
           vk.MANIFEST_NAME == "KIT_MANIFEST.json" and vk.MANIFEST_NAME in builder)
 
 
+def test_attachments() -> None:
+    """The paperclip contract, minus OCR: what may be attached, what it
+    becomes, and that nothing outlives the turn.
+
+    Deliberately tesseract-free (text extraction only) so the suite keeps its
+    promise of the same checks with and without TESSERACT_CMD; the image path
+    is covered by apitest and the end-to-end flow, which run where OCR exists.
+    """
+    import attachments
+    from schemas import Modality
+
+    # 2026-11-06: the paperclip arrived; a reject that silently accepted an
+    # .exe would index binary noise as evidence.
+    try:
+        attachments.validate_attachment("payload.exe", 10)
+        rejected = False
+    except attachments.AttachmentError:
+        rejected = True
+    check("an executable is refused as an attachment", rejected)
+
+    try:
+        attachments.validate_attachment("big.pdf", 10**12)
+        sized = False
+    except attachments.AttachmentError:
+        sized = True
+    check("an oversize attachment is refused", sized)
+
+    ok = True
+    for name in ("note.txt", "scan.png", "report.pdf", "table.csv"):
+        try:
+            attachments.validate_attachment(name, 1024)
+        except attachments.AttachmentError:
+            ok = False
+    check("documents and images pass validation", ok)
+
+    try:
+        attachments.extract_attachments(None, [])
+        empty = False
+    except attachments.AttachmentError:
+        empty = True
+    check("extracting no attachments is an error, not an empty answer", empty)
+
+    try:
+        attachments.extract_attachments(None, [("f.txt", b"x")] * 6)
+        capped = False
+    except attachments.AttachmentError:
+        capped = True
+    check("more than five attachments is refused before any extraction", capped)
+
+    from rag_pipeline import get_pipeline
+
+    pipeline = get_pipeline()
+    note = b"Night handover.\nThe codeword is tangerine wharf nine.\n"
+    before = _attach_dirs()
+    evidence, filenames, warnings = attachments.extract_attachments(
+        pipeline, [("handover_note.txt", note)]
+    )
+    check("a text attachment becomes rerank-pool evidence",
+          len(evidence) >= 1
+          and all(hasattr(r.item, "content") for r in evidence))
+    check("attachment evidence carries the codeword the question will ask",
+          any("tangerine wharf nine" in r.item.content for r in evidence))
+    check("attachment evidence is typed as text",
+          all(r.item.modality == Modality.TEXT for r in evidence))
+    check("the upload name, not a temp name, labels the ephemeral source",
+          list(filenames.values()) == ["handover_note.txt"]
+          and all(source_id for source_id in filenames))
+    check("extraction reports no warnings for a clean text file", warnings == [])
+
+    twice, _, _ = attachments.extract_attachments(
+        pipeline, [("handover_note.txt", note), ("handover_note.txt", note)]
+    )
+    check("the same file attached twice adds no duplicate evidence",
+          len(twice) == len(evidence))
+
+    check("no attachment temp directory outlives the turn",
+          _attach_dirs() == before)
+
+    class _Loc:
+        image_path = None
+
+    class _Item:
+        def __init__(self):
+            self.location = _Loc()
+            self.metadata = {"crop": ""}
+
+    tmp = Path(tempfile.mkdtemp(prefix="eai-attach-"))
+    item = _Item()
+    item.location.image_path = str(tmp / "crop.png")
+    item.metadata["crop"] = str(tmp / "crop.png")
+    item.metadata["keep"] = "page 2"
+    attachments._scrub(item, tmp)
+    check("temp paths are scrubbed from what a citation would carry",
+          item.location.image_path is None
+          and item.metadata["crop"] == "crop.png"
+          and item.metadata["keep"] == "page 2")
+    import shutil as _shutil
+    _shutil.rmtree(tmp, ignore_errors=True)
+
+    # 2026-11-06: "explain this document" was refused because the score gate
+    # treated an instruction as a search. The fix lives partly in the prompt:
+    # attachment turns carry rules that say the attached material is what the
+    # question is about, and corpus prompts must stay byte-identical to the
+    # ones the gate of record measured.
+    import llm
+    from schemas import ContentItem, Modality, SourceLocation
+
+    item = ContentItem(item_id="i1", source_id="s1", modality=Modality.TEXT,
+                       content="The vault codeword is indigo harbor melon.",
+                       location=SourceLocation())
+    evidence = [type("R", (), {"item": item})()]
+    plain = llm.build_prompt("explain this document", evidence, {"s1": "a.pdf"})
+    attached = llm.build_prompt("explain this document", evidence, {"s1": "a.pdf"},
+                                attachment_turn=True)
+    check("attachment turns carry the attachment reading rules",
+          "attached one or more files" in attached
+          and "attached one or more files" not in plain)
+    check("corpus prompts stay byte-identical when no attachment is present",
+          plain == llm.build_prompt("explain this document", evidence, {"s1": "a.pdf"}))
+    discovery = llm.build_prompt("which sources relate to this?", evidence,
+                                 {"s1": "a.pdf"}, attachment_turn=True)
+    check("discovery prompts keep their own rules, attachment or not",
+          "evidence-discovery system" in discovery
+          and "attached one or more files" not in discovery)
+
+    # Intent routing: instructions ABOUT the attachment get an
+    # attachment-only context (a cross-encoder scores them at the floor
+    # against every passage, so the relevance race is noise); factual
+    # questions must never match, or the corpus would be switched off.
+    import rag_pipeline
+    directed = ["explain this document", "Summarise this file",
+                "what does this document say", "tell me about this document",
+                "describe my report", "analyse the uploaded sheet"]
+    factual = ["What percentage of the budget was utilised?",
+               "what was the vault codeword?",
+               "explain the difference between RAG and fine-tuning",
+               "read the csv and list departments",
+               "summarise the assessment split and passing criteria"]
+    check("attachment-directed instructions are routed attachment-only",
+          all(rag_pipeline.ATTACHMENT_DIRECTED.search(q) for q in directed))
+    check("factual questions are never routed away from the corpus",
+          not any(rag_pipeline.ATTACHMENT_DIRECTED.search(q) for q in factual))
+
+
+def _attach_dirs() -> set:
+    import tempfile as _tf
+    return {p.name for p in Path(_tf.gettempdir()).glob("eai-attach-*")}
+
+
 def main() -> int:
     print("Evidence AI offline self-test")
     print(f"throwaway index: {_TMP}")
@@ -1381,7 +1530,7 @@ def main() -> int:
                  test_parents, test_observability, test_store, test_rate_limit,
                  test_configuration, test_dump_chunks, test_collections,
                  test_pdf_tables, test_contextual, test_experiment_harness,
-                 test_kit_verifier):
+                 test_kit_verifier, test_attachments):
         test()
 
     failed = [entry for entry in CHECKS if not entry[1]]

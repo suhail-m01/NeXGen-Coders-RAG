@@ -55,6 +55,23 @@ Rules you must follow without exception:
 # metrics at this model size re-roll on any prompt edit, so prompt changes are
 # only kept when they measurably help. See WINDOWS_SETUP_GUIDE.md section 8.
 
+# An attachment turn is reading comprehension over a file the user handed
+# over, not a search: "explain this document" has no retrieval-style answer,
+# so the rules say what to do with attached material and restate the one
+# contract that never relaxes - nothing enters the answer from the model's
+# own knowledge. Appended only on attachment turns, so corpus prompts stay
+# byte-identical to the ones the gate of record measured.
+ATTACHMENT_RULES = """
+The user attached one or more files to this question. The evidence blocks
+whose filename matches an attachment are that material; read them as what
+the question is about.
+10. Explain, summarise or answer from the attached material first, then the
+   rest of the evidence above if it adds anything.
+11. If the question asks for something the attached material and the rest of
+   the evidence do not contain, say that the attachment does not cover it.
+   Never fill the gap from your own knowledge.
+"""
+
 DISCOVERY_RULES = """You are Evidence AI, a grounded evidence-discovery system.
 
 The user is not asking a factual question. They are asking WHICH SOURCES in
@@ -315,9 +332,12 @@ def build_prompt(
     query: str,
     evidence: list[RerankedResult],
     filenames: dict[str, str],
+    attachment_turn: bool = False,
 ) -> str:
     discovery = is_discovery_query(query)
     rules = DISCOVERY_RULES if discovery else SYSTEM_RULES
+    if attachment_turn and not discovery:
+        rules += ATTACHMENT_RULES
     closing = (
         "List and describe the related evidence above."
         if discovery
@@ -338,10 +358,12 @@ def generate_answer(
     evidence: list[RerankedResult],
     filenames: dict[str, str],
     inspect_image: Path | None = None,
+    attachment_turn: bool = False,
 ) -> str:
     """Produce a grounded answer. `inspect_image` optionally hands the
     original image to the vision model for direct inspection."""
-    prompt = build_prompt(query, evidence, filenames)
+    prompt = build_prompt(query, evidence, filenames,
+                          attachment_turn=attachment_turn)
     images = [inspect_image] if inspect_image else None
     return ollama_generate(prompt, image_paths=images)
 
@@ -351,9 +373,11 @@ def generate_answer_stream(
     evidence: list[RerankedResult],
     filenames: dict[str, str],
     inspect_image: Path | None = None,
+    attachment_turn: bool = False,
 ):
     """Streaming twin of generate_answer: yields tokens, same prompt rules."""
-    prompt = build_prompt(query, evidence, filenames)
+    prompt = build_prompt(query, evidence, filenames,
+                          attachment_turn=attachment_turn)
     images = [inspect_image] if inspect_image else None
     yield from ollama_generate_stream(prompt, image_paths=images)
 

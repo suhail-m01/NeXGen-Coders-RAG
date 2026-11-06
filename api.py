@@ -73,6 +73,36 @@ app.add_middleware(
 )
 
 
+SESSION_COOKIE = "eai_session"
+
+
+def present_token(request: Request, authorization: str | None) -> tuple[str | None, str]:
+    """Pick the bearer token out of whichever transport carried it.
+
+    Order: `Authorization` header, `X-EAI-Token` header, session cookie, then
+    the `access_token` query parameter. The first is the documented transport;
+    the others exist because some reverse proxies and sandboxed embed viewers
+    strip or refuse the `Authorization` header, and a UI that cannot
+    authenticate at all is worse than a UI whose token rides on a second
+    header. The cookie is set by /login itself, so a browser that blocks
+    script storage still stays signed in across reloads. A token in a query
+    string can land in proxy logs, which is why it is tried last and why the
+    UI only switches to it after a header attempt was visibly dropped.
+    """
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1].strip(), "header"
+    alt = request.headers.get("x-eai-token")
+    if alt:
+        return alt.strip(), "x-eai-token"
+    cookie = request.cookies.get(SESSION_COOKIE)
+    if cookie:
+        return cookie, "cookie"
+    query = request.query_params.get("access_token")
+    if query:
+        return query.strip(), "query"
+    return None, "none"
+
+
 def require(permission: str):
     """FastAPI dependency: resolve a bearer token and check one permission.
 
@@ -82,17 +112,20 @@ def require(permission: str):
     """
     from auth import can, get_user_store
 
-    def dependency(authorization: str | None = Header(default=None)) -> dict:
+    def dependency(
+        request: Request, authorization: str | None = Header(default=None)
+    ) -> dict:
         if not settings.api_auth_enabled:
             return {"username": "api-auth-disabled", "role": "admin", "via": "disabled"}
-        if not authorization or not authorization.lower().startswith("bearer "):
+        token, transport = present_token(request, authorization)
+        if not token:
             raise HTTPException(
                 status_code=401,
                 detail={"error": "Missing bearer token.",
                         "hint": "Authorization: Bearer eai_... "
                                 "(scripts\\create_user.py --create-token)"},
             )
-        account = get_user_store().authenticate_token(authorization.split(" ", 1)[1].strip())
+        account = get_user_store().authenticate_token(token)
         if account is None:
             raise HTTPException(
                 status_code=401,
@@ -104,6 +137,12 @@ def require(permission: str):
                 detail={"error": f"Role '{account['role']}' may not {permission}.",
                         "username": account["username"]},
             )
+        if transport != "header":
+            # Instrumentation, not decoration: when a preview proxy or an
+            # embed viewer eats the Authorization header, this line is the
+            # only place that shows which transport actually carried the
+            # session, so a 401 in the wild is diagnosable from the log.
+            logger.info("Authenticated %s via the %s transport", account["username"], transport)
         return account
 
     return dependency
@@ -448,6 +487,93 @@ def query_stream(
     )
 
 
+@app.post("/query_attachment", response_model=None)
+async def query_attachment(
+    query: str = Form(...),
+    # Optional at the FastAPI layer so a missing field reaches this route's own
+    # 400 (which names the field and the accepted formats) instead of a bare
+    # 422 from the validation edge.
+    files: list[UploadFile] | None = File(default=None),
+    session_id: str | None = Form(default=None),
+    collection: str | None = Form(default=None),
+    backend: str | None = Form(default=None),
+    account: dict = Depends(rate_limited("queries", "ask")),
+):
+    """Ask a question *with* documents or images attached, ChatGPT-style.
+
+    The uploads are extracted with the ingestion processors (text layer and
+    tables for documents, OCR and vision for images), join the reranking pool
+    as ephemeral evidence for this turn, and then flow through the identical
+    pipeline: abstention gate before generation, coverage and entity guards,
+    synthesis, citations, history. An attachment therefore cannot buy an
+    unguarded answer - a question the attachment does not cover is refused
+    with the same error code as an empty corpus.
+
+    Attachments are never indexed and never persisted: the bytes live in a
+    temporary directory for one extraction and the only trace afterwards is
+    the citation in the recorded turn. A file worth asking about twice belongs
+    in Sources > ingest instead.
+
+    Multipart rather than JSON because browsers hand uploads over that way;
+    the response is the same NDJSON contract as /query_stream, so a client
+    that can stream one can stream the other. Rate limited on the `queries`
+    bucket like every question, and validation failures (no file, unsupported
+    type, oversize, unreadable content) are 400s that name the file, because
+    a paperclip that fails silently teaches people not to use it.
+    """
+    from attachments import AttachmentError, extract_attachments
+
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "No attachment was supplied.",
+                    "hint": "POST /query_attachment expects at least one "
+                            "multipart file in the 'files' field."},
+        )
+    payload: list[tuple[str, bytes]] = []
+    for upload in files:
+        data = await upload.read()
+        payload.append((upload.filename or "attachment", data))
+    try:
+        evidence, filenames, warnings = extract_attachments(get_pipeline(), payload)
+    except AttachmentError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)})
+
+    request = QueryRequest(
+        query=query,
+        query_modality="text",
+        **({"collection": collection} if collection else {}),
+    )
+    from rag_pipeline import last_technical_detail
+
+    pipeline = get_pipeline()
+
+    def lines():
+        final = None
+        for item in pipeline.query_stream_attached(
+            request, evidence, filenames, backend=backend
+        ):
+            if isinstance(item, str):
+                if item:
+                    yield json.dumps({"type": "token", "content": item}) + "\n"
+            else:
+                final = item
+        result_payload = {
+            **(final.model_dump(mode="json") if final is not None else {}),
+            "technical_detail": last_technical_detail(),
+            "attachment_warnings": warnings,
+            "session_id": (_record_turn(request, final, backend, session_id)
+                           if final is not None else None),
+        }
+        yield json.dumps({"type": "result", "content": result_payload}) + "\n"
+
+    return StreamingResponse(
+        lines(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/models")
 def models(account: dict = Depends(require("ask"))) -> dict:
     """What the inference server has installed, next to what this build configured.
@@ -656,7 +782,7 @@ def _permissions_for(role) -> list[str]:
 
 
 @app.post("/login")
-def login(payload: LoginRequest) -> dict:
+def login(payload: LoginRequest, response: Response) -> dict:
     """Exchange a username and password for a bearer token.
 
     The API is token-based and a CLI token is minted by
@@ -710,8 +836,21 @@ def login(payload: LoginRequest) -> dict:
         )
 
     role = account["role"]
+    token = store.create_token(account["username"], label="web-ui")
+    # The same credential as a HttpOnly cookie, for contexts where the page
+    # cannot keep it in script storage (sandboxed embed viewers) or where a
+    # proxy drops the Authorization header. Same-site lax, scoped to this
+    # service, and cleared again by /logout.
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=43200,  # 12 h: a demo day, not a persistent session
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
     return {
-        "token": store.create_token(account["username"], label="web-ui"),
+        "token": token,
         "username": account["username"],
         "role": role.value if hasattr(role, "value") else str(role),
         "permissions": _permissions_for(role),
@@ -809,16 +948,21 @@ def me(account: dict = Depends(require("ask"))) -> dict:
 
 
 @app.post("/logout")
-def logout(authorization: str | None = Header(default=None)) -> dict:
+def logout(
+    response: Response,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict:
     """Revoke the presented token, so signing out destroys the credential rather
     than only forgetting it in the browser."""
-    if not settings.api_auth_enabled or not authorization:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    if not settings.api_auth_enabled:
         return {"revoked": False}
-    if not authorization.lower().startswith("bearer "):
+    token, _ = present_token(request, authorization)
+    if not token:
         return {"revoked": False}
     from auth import TOKEN_VISIBLE_CHARS, get_user_store
 
-    token = authorization.split(" ", 1)[1].strip()
     if len(token) < TOKEN_VISIBLE_CHARS:
         return {"revoked": False}
     try:
