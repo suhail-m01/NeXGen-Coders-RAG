@@ -83,8 +83,15 @@ def embed_query(query: str) -> np.ndarray:
 
 
 def embed_items(items: list[ContentItem], batch_size: int = 32) -> np.ndarray:
-    """Embed the `content` of each ContentItem, in order."""
-    return embed_texts([item.content for item in items], batch_size=batch_size)
+    """Embed each item's indexed text, in order.
+
+    That is the item's content, preceded by its situating blurb when contextual
+    retrieval wrote one at ingest. With the feature off -- the default -- no item has
+    a blurb and this embeds `content` exactly as it always did.
+    """
+    from contextual import indexed_text
+
+    return embed_texts([indexed_text(item) for item in items], batch_size=batch_size)
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

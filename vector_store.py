@@ -4,8 +4,9 @@ vector_store.py -- persistent local storage.
     FAISS   IndexFlatIP over L2-normalized 384-d vectors (inner product ==
             cosine). Exact search: no training step, no recall loss, nothing
             to tune, and faster than an approximate index at this scale.
-    SQLite  sources, content items, and deterministic relationships. It is
-            the authority mapping a FAISS row ordinal back to a ContentItem.
+    SQLite  sources, content items, parent blocks, deterministic relationships
+            and declared collection names. It is the authority mapping a FAISS
+            row ordinal back to a ContentItem.
 
 Both are written on every ingest, so the index survives a restart.
 Everything is local; no remote vector database is involved.
@@ -16,6 +17,7 @@ import json
 import logging
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +34,11 @@ from schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The bucket a source lands in when nobody names one. It cannot be renamed or
+# deleted: ingestion defaults to it, and deleting a collection moves its sources
+# here, so removing it would have nowhere to put them.
+DEFAULT_COLLECTION = "general"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -76,6 +83,15 @@ CREATE TABLE IF NOT EXISTS relationships (
     relationship_type TEXT NOT NULL,
     confidence        REAL,
     metadata          TEXT NOT NULL
+);
+
+-- Declared collection names. A collection also comes into existence implicitly
+-- when a source is filed under it, so this table is not the whole list; it is the
+-- part that can exist before anything is filed under it. Without it, "create a
+-- collection" would be a no-op that disappeared on the next refresh.
+CREATE TABLE IF NOT EXISTS collections (
+    name       TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_items_source    ON items(source_id);
@@ -498,12 +514,189 @@ class VectorStore:
         return {name: versions for name, versions in out.items() if len(versions) > 1}
 
     def list_collections(self) -> list[dict]:
-        """Collections present in the index, with source counts."""
-        rows = self._conn.execute(
-            "SELECT collection, COUNT(*) AS sources FROM sources "
-            "GROUP BY collection ORDER BY collection"
-        ).fetchall()
-        return [{"collection": row["collection"], "sources": row["sources"]} for row in rows]
+        """Every collection, with how many sources and indexed items it holds.
+
+        Two kinds are merged: collections implied by a source that is filed under
+        them, and collections declared through create_collection() that are still
+        empty. An empty declared collection is a real thing to have -- a "Q3 board
+        pack" group waiting for files -- and deriving the list from sources alone
+        would make it vanish between creating it and filling it.
+
+        The `items` count was added with the collections API; callers that only
+        read `collection` and `sources` are unaffected.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT s.collection AS name,
+                          COUNT(DISTINCT s.source_id) AS sources,
+                          COUNT(i.item_id) AS items
+                     FROM sources s
+                     LEFT JOIN items i ON i.source_id = s.source_id
+                 GROUP BY s.collection"""
+            ).fetchall()
+            declared = [
+                row["name"] for row in self._conn.execute("SELECT name FROM collections")
+            ]
+        grouped = {
+            row["name"]: {
+                "collection": row["name"],
+                "sources": row["sources"],
+                "items": row["items"],
+            }
+            for row in rows
+        }
+        for name in declared:
+            grouped.setdefault(name, {"collection": name, "sources": 0, "items": 0})
+        return [grouped[name] for name in sorted(grouped, key=str.lower)]
+
+    @staticmethod
+    def validate_collection_name(name: str) -> str:
+        """Normalize a collection name, or raise ValueError saying why it is refused.
+
+        Whitespace is collapsed and the name capped, because a collection name is
+        typed into a query scope, a CLI argument and a URL path. Path separators
+        are refused: the name is not a path. Control characters are refused on the
+        raw input *before* any normalization, because silently rewriting "Q3\nPack"
+        into "Q3 Pack" would accept something the caller did not ask for -- and a
+        newline inside a name corrupts every line of output it appears in.
+        """
+        raw = str(name or "")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw):
+            raise ValueError(
+                "A collection name cannot contain control characters, including a "
+                "newline or tab."
+            )
+        cleaned = " ".join(raw.split())[:60]
+        if not cleaned:
+            raise ValueError("A collection name cannot be empty.")
+        if any(character in cleaned for character in "/\\"):
+            raise ValueError(
+                "A collection name cannot contain a path separator ('/' or '\\')."
+            )
+        return cleaned
+
+    def collection_exists(self, name: str) -> bool:
+        """Case-insensitively, because 'Board' beside 'board' is a trap, not a feature."""
+        wanted = str(name or "").strip().lower()
+        if not wanted:
+            return False
+        with self._lock:
+            existing = [row["collection"] for row in
+                        self._conn.execute("SELECT DISTINCT collection FROM sources")]
+            existing += [row["name"] for row in
+                         self._conn.execute("SELECT name FROM collections")]
+        return any(candidate.lower() == wanted for candidate in existing)
+
+    def create_collection(self, name: str) -> str:
+        """Declare an empty collection and return the normalized name.
+
+        Idempotent: declaring a name that already exists is not an error, it is
+        what a second browser tab does.
+
+        The default collection is the one exception, and it returns without writing
+        anything. `general` is implied by every source filed under it and ingestion
+        always files into it, so it can never be the empty group waiting for files
+        that this table exists to remember. Declaring it anyway made two corpora
+        that are logically identical differ physically: a freshly built index has no
+        declared rows, and one assign-to-general later it has one, with nothing
+        observable through the API to show for it. That asymmetry is what made "the
+        index is left exactly as it was found" unprovable on a first run - it passed
+        on every run after the one that wrote the row.
+        """
+        cleaned = self.validate_collection_name(name)
+        if cleaned == DEFAULT_COLLECTION:
+            logger.info("Collection '%s' is the default and is implied, not declared",
+                        cleaned)
+            return cleaned
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO collections(name, created_at) VALUES(?,?)",
+                (cleaned, datetime.now(timezone.utc).isoformat()),
+            )
+            self._conn.commit()
+        logger.info("Collection declared: %s", cleaned)
+        return cleaned
+
+    def rename_collection(self, old: str, new: str) -> int:
+        """Move every source in `old` to `new` and return how many moved.
+
+        The sources keep their items, vectors and relationships: a collection is a
+        label on a source row, so renaming one rewrites no embeddings and cannot
+        corrupt the index. `new` is declared as well, so a rename that empties a
+        group still leaves the group there.
+        """
+        cleaned = self.validate_collection_name(new)
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE sources SET collection = ? WHERE collection = ?", (cleaned, old)
+            )
+            moved = cursor.rowcount
+            self._conn.execute("DELETE FROM collections WHERE name = ?", (old,))
+            self._conn.execute(
+                "INSERT OR IGNORE INTO collections(name, created_at) VALUES(?,?)",
+                (cleaned, datetime.now(timezone.utc).isoformat()),
+            )
+            self._conn.commit()
+        logger.info("Collection renamed %s -> %s (%d source(s) moved)", old, cleaned, moved)
+        return moved
+
+    def delete_collection(self, name: str) -> int:
+        """Ungroup a collection: its sources move to the default, nothing is deleted.
+
+        This is the part worth being explicit about, because "delete collection"
+        reads like "delete the documents in it" and does not mean that here. The
+        sources, their indexed items, their vectors and the files on disk all
+        survive; only the grouping goes away, and a query scoped to the deleted
+        name simply stops matching.
+        """
+        if name == DEFAULT_COLLECTION:
+            raise ValueError(
+                f"The '{DEFAULT_COLLECTION}' collection is the default: ingestion "
+                "files into it and deleting a collection moves its sources there, "
+                "so it cannot itself be deleted."
+            )
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE sources SET collection = ? WHERE collection = ?",
+                (DEFAULT_COLLECTION, name),
+            )
+            moved = cursor.rowcount
+            self._conn.execute("DELETE FROM collections WHERE name = ?", (name,))
+            self._conn.commit()
+        logger.info("Collection deleted: %s (%d source(s) moved to %s)",
+                    name, moved, DEFAULT_COLLECTION)
+        return moved
+
+    def assign_sources(self, source_ids, collection: str) -> int:
+        """File existing sources under a collection, returning how many moved.
+
+        Unknown ids are ignored rather than raising: a browser holding a stale
+        source list should move what still exists and report the count, not fail
+        the whole batch. The collection is declared if it was not, which is what
+        ingestion already does when it is given a new name - except the default,
+        which is implied by its sources and never written to the declared table
+        (see create_collection).
+        """
+        cleaned = self.validate_collection_name(collection)
+        wanted = [str(identifier) for identifier in source_ids if str(identifier).strip()]
+        if not wanted:
+            return 0
+        with self._lock:
+            if cleaned != DEFAULT_COLLECTION:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO collections(name, created_at) VALUES(?,?)",
+                    (cleaned, datetime.now(timezone.utc).isoformat()),
+                )
+            moved = 0
+            for source_id in wanted:
+                cursor = self._conn.execute(
+                    "UPDATE sources SET collection = ? WHERE source_id = ?",
+                    (cleaned, source_id),
+                )
+                moved += cursor.rowcount
+            self._conn.commit()
+        logger.info("Assigned %d source(s) to collection %s", moved, cleaned)
+        return moved
 
     def source_ids_in_collection(self, collection: str) -> set[str]:
         rows = self._conn.execute(

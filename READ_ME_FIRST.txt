@@ -27,22 +27,30 @@ Short version, in PowerShell:
     2. Install Ollama              https://ollama.com/download
     3. Install Tesseract OCR       winget install UB-Mannheim.TesseractOCR
     4. Unzip this kit to           C:\EvidenceAI      (no spaces, not OneDrive)
+       Prove the download first - needs only Python, nothing installed yet:
+       python scripts\verify_kit.py --zip EvidenceAI_Windows_Kit.zip --extract C:\EvidenceAI
     5. cd C:\EvidenceAI
        Get-ChildItem -Recurse | Unblock-File
        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
     6. .\setup_windows.ps1
        (low-memory machine instead:  .\setup_windows.ps1 -Model qwen2.5:1.5b)
-    7. .\start.ps1
+    7. Print DEMO_CUE_CARD.md if you are demonstrating - one page, the seven
+       questions in order with the seconds each costs and the lines to say.
+    8. .\start.ps1
        React UI ->  http://127.0.0.1:8000/ui/   (opened for you)
        Streamlit ->  http://localhost:8501       (accounts, history, collections)
        API docs ->  http://127.0.0.1:8000/docs
 
     Checks, any time (cheapest first):
-       .venv\Scripts\python scripts\selftest.py         86 checks, no model/network
+       .venv\Scripts\python scripts\selftest.py         258 checks, no model/network
+       .venv\Scripts\python scripts\verify_kit.py       10 checks on this archive
+                                                          (RECOVERY.md if one fails)
+       .venv\Scripts\python scripts\apitest.py          78 checks on the API + React UI
        .venv\Scripts\python scripts\verify_env.py       environment
        .venv\Scripts\python scripts\smoke_test.py       real Q&A with citations
        .venv\Scripts\python scripts\verify_offline.py   proves no internet needed
        .venv\Scripts\python evaluation.py --compare     16-query report + the gate
+       .venv\Scripts\python scripts\dump_chunks.py --all  what is indexed, chunk sizes
        .venv\Scripts\python scripts\manifest.py         the build behind a result
        .venv\Scripts\python scripts\calibrate_abstention.py   threshold report
 

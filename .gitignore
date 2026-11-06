@@ -36,6 +36,9 @@ data/audio/*
 evaluation/reports/*
 !evaluation/reports/.gitkeep
 
+# Experiment output (paired-arm runs; outputs, not source)
+evaluation/experiments/
+
 # Model caches
 .cache/
 *.bin

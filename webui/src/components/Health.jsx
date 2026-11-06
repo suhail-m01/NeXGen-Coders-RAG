@@ -64,16 +64,22 @@ function Section({ title, value }) {
 export default function Health() {
   const [health, setHealth] = useState(null)
   const [manifest, setManifest] = useState(null)
+  const [models, setModels] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     let alive = true
-    Promise.all([api.health(), api.manifest().catch(() => null)])
-      .then(([healthData, manifestData]) => {
+    Promise.all([
+      api.health(),
+      api.manifest().catch(() => null),
+      api.models().catch(() => null),
+    ])
+      .then(([healthData, manifestData, modelsData]) => {
         if (!alive) return
         setHealth(healthData)
         setManifest(manifestData)
+        setModels(modelsData)
       })
       .catch((err) => alive && setError(err))
       .finally(() => alive && setLoading(false))
@@ -98,6 +104,8 @@ export default function Health() {
   const guards = runtime.guards || {}
   const generation = runtime.generation || {}
   const ram = runtime.ram_mb || {}
+  const limits = runtime.rate_limit || {}
+  const buckets = limits.buckets || {}
 
   return (
     <>
@@ -137,6 +145,53 @@ export default function Health() {
             {health.inference.technical}
           </pre>
         )}
+      </div>
+
+      <div className="card">
+        <h2>Language model</h2>
+        {models ? (
+          <>
+            <div className="metrics">
+              <Stat label="Configured" value={models.configured || '—'} />
+              <Stat
+                label="Server"
+                value={models.reachable ? 'answering' : 'not answering'}
+              />
+              <Stat
+                label="Configured model present"
+                value={models.configured_present ? 'yes' : 'no'}
+              />
+              <Stat label="Models on server" value={(models.names || []).length} />
+            </div>
+            {(models.names || []).length > 0 && (
+              <p className="muted small">
+                Installed: <code>{models.names.join(', ')}</code>
+              </p>
+            )}
+            {models.hint && (
+              <div className="banner warn">
+                <strong>The configured model is not the one installed</strong>
+                {models.hint}
+              </div>
+            )}
+            {models.error && (
+              <div className="banner bad">
+                <strong>Cannot reach the inference server</strong>
+                {models.error}
+              </div>
+            )}
+          </>
+        ) : (
+          <p className="muted small">
+            <code>/models</code> did not answer, so what the inference server has
+            installed is unknown. Nothing else on this page depends on it.
+          </p>
+        )}
+        <p className="muted small">
+          Read-only by design. The configuration of record is <code>.env</code>, and the
+          run manifest attributes every evaluation result to the build that produced it,
+          so a control here that changed the model would silently break that attribution.
+        </p>
       </div>
 
       <div className="card">
@@ -200,6 +255,38 @@ export default function Health() {
             The working tree has uncommitted changes, so this build is not exactly the
             commit shown. Commit before quoting a result.
           </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Rate limiting</h2>
+        {limits.enabled ? (
+          <>
+            <div className="metrics">
+              {Object.entries(buckets).map(([name, bucket]) => (
+                <Stat
+                  key={name}
+                  label={`${name} / minute`}
+                  value={`${bucket.per_minute} + ${bucket.burst} burst`}
+                />
+              ))}
+              {Object.entries(buckets).map(([name, bucket]) => (
+                <Stat key={`t-${name}`} label={`${name} clients tracked`} value={bucket.tracked_clients} />
+              ))}
+            </div>
+            <p className="small" style={{ marginTop: 10 }}>
+              Applies to the routes that run models — <code>/query</code>,{' '}
+              <code>/query_file</code> and <code>/ingest</code> — and to nothing else. Past
+              the limit a request is refused with 429 and a <code>Retry-After</code> header
+              before any model is loaded. {limits.scope}.
+            </p>
+          </>
+        ) : (
+          <p className="small">
+            Disabled (<code>RATE_LIMIT_ENABLED=false</code>). Every route that runs a model
+            will accept as many concurrent requests as arrive, and on a small GPU they will
+            queue behind each other rather than fail fast.
+          </p>
         )}
       </div>
 

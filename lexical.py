@@ -23,6 +23,7 @@ import re
 from collections import defaultdict
 
 from config import settings
+from contextual import indexed_text
 from schemas import ContentItem
 from vector_store import VectorStore
 
@@ -73,7 +74,9 @@ class LexicalIndex:
         df: dict[str, int] = defaultdict(int)
         dl: list[int] = []
         for item in items:
-            tokens = tokenize(item.content or "")
+            # The same text the embedding sees, so a situating blurb helps the
+            # lexical leg too -- and with no blurb this is item.content.
+            tokens = tokenize(indexed_text(item))
             counts: dict[str, int] = defaultdict(int)
             for token in tokens:
                 counts[token] += 1

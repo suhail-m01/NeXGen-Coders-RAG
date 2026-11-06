@@ -13,6 +13,7 @@ Nothing here touches the network.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -184,6 +185,245 @@ def _mime_for(source_type: SourceType) -> str:
 Extracted = tuple[str, SourceLocation, dict]
 
 
+# A caption is paired with a table by its number when the page numbers its tables,
+# and by position when it has exactly one of each. Anything else gets a plain
+# "Table N" section rather than a caption guessed from a neighbouring paragraph:
+# a wrong caption is worse than none, because it is the text a reader cites.
+_TABLE_CAPTION_RE = re.compile(
+    r"(?:Table|Tab\.|Exhibit)\s*(\d+)\s*[:.\-\u2014]\s*([^\n]+)",
+    re.IGNORECASE,
+)
+
+
+def _table_captions(page_text: str) -> dict[int, str]:
+    captions: dict[int, str] = {}
+    for match in _TABLE_CAPTION_RE.finditer(page_text or ""):
+        try:
+            number = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        body = " ".join(match.group(2).split())
+        if body:
+            captions[number] = f"Table {number}: {body}"
+    return captions
+
+
+def _prune_grid(cells) -> list[list[str]]:
+    """Flatten every cell to one line and drop rows and columns that are empty.
+
+    Dropping an all-empty column loses nothing -- there is nothing in it -- but
+    keeping it costs a pipe in every row and tells the model the table has a field
+    it does not. The demo deck's literature survey is six columns wide with one
+    column blank all the way down, which is exactly the artefact a layout heuristic
+    produces when two ruled columns sit close together.
+    """
+    grid = [
+        [" ".join(str(cell).split()) if cell is not None else "" for cell in row]
+        for row in cells or []
+    ]
+    if not grid:
+        return []
+    width = max(len(row) for row in grid)
+    grid = [row + [""] * (width - len(row)) for row in grid]
+    kept = [index for index in range(width) if any(row[index] for row in grid)]
+    if not kept:
+        return []
+    grid = [[row[index] for index in kept] for row in grid]
+    return [row for row in grid if any(row)]
+
+
+def _grid_to_markdown(grid: list[list[str]]) -> str:
+    """Render a pruned grid as GitHub-flavoured markdown. Row 0 is the header."""
+    if not grid or not grid[0]:
+        return ""
+    lines = ["| " + " | ".join(cell or " " for cell in grid[0]) + " |",
+             "|" + "|".join(["---"] * len(grid[0])) + "|"]
+    lines.extend("| " + " | ".join(cell or " " for cell in row) + " |" for row in grid[1:])
+    return "\n".join(lines)
+
+
+def _table_bbox(found) -> tuple[float, float, float, float] | None:
+    raw = getattr(found, "bbox", None)
+    if raw is None:
+        return None
+    try:
+        coords = tuple(float(value) for value in raw)
+    except (TypeError, ValueError):
+        return None
+    if len(coords) != 4:
+        return None
+    x0, y0, x1, y1 = coords
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _cell_rects(found) -> list[list]:
+    """One row of cell rectangles per row, `None` where a cell does not exist.
+
+    Read from `table.rows[i].cells[j]` rather than from the flat `table.cells`
+    tuple, which on this corpus is shorter than rows x columns and so cannot be
+    reshaped reliably -- merged and sliver cells are simply absent from it.
+    """
+    rows = []
+    for row in getattr(found, "rows", []) or []:
+        rects = []
+        for cell in getattr(row, "cells", []) or []:
+            if cell is None:
+                rects.append(None)
+                continue
+            try:
+                coords = tuple(float(value) for value in cell)
+            except (TypeError, ValueError):
+                rects.append(None)
+                continue
+            rects.append(coords if len(coords) == 4 else None)
+        rows.append(rects)
+    return rows
+
+
+def _centre(word) -> tuple[float, float]:
+    return ((word[0] + word[2]) / 2.0, (word[1] + word[3]) / 2.0)
+
+
+def _claim(words, taken: list[bool], box) -> list[int]:
+    """The indices of the words whose centre falls in `box` and are not yet claimed.
+
+    Claiming is what makes the split exact. A word belongs to the first cell that
+    contains it and to nothing else, so prose and tables together hold every word on
+    the page exactly once -- no duplication where two ruled cells overlap, and no
+    silence where a note sits inside the table's box but outside every cell. That
+    second case is not hypothetical: the demo deck draws a "RESEARCH GAP" callout
+    inside the ruled area on page 5, and an area-overlap rule swallowed it.
+    """
+    x0, y0, x1, y1 = box
+    claimed = []
+    for index, word in enumerate(words):
+        if taken[index]:
+            continue
+        cx, cy = _centre(word)
+        if x0 <= cx <= x1 and y0 <= cy <= y1:
+            taken[index] = True
+            claimed.append(index)
+    return claimed
+
+
+def _words_to_text(words, indices) -> str:
+    """Rebuild reading-order text from word tuples, keeping line breaks."""
+    lines: dict[tuple[int, int], list] = {}
+    for index in indices:
+        word = words[index]
+        lines.setdefault((word[5], word[6]), []).append((word[7], word[4]))
+    return "\n".join(
+        " ".join(text for _, text in sorted(group))
+        for _, group in sorted(lines.items())
+    )
+
+
+def _release(taken: list[bool], indices) -> None:
+    """Hand claimed words back to the prose.
+
+    Called whenever a candidate region is rejected -- too small to be a table, or
+    unreadable -- because a word claimed by a cell that never became an item would
+    otherwise vanish from the page: not in the prose, not in any grid. Losing text
+    quietly is the one failure an extraction change must not have.
+    """
+    for index in indices:
+        taken[index] = False
+
+
+def _prose_without(words, taken: list[bool]) -> str:
+    """The page's text with every word claimed by a table cell left out."""
+    return _words_to_text(words, [i for i in range(len(words)) if not taken[i]]).strip()
+
+
+def _page_tables(page, words, page_index: int, warnings: list[str]):
+    """Detect the tables on one page. Returns (table dicts, claimed-word mask).
+
+    Cell text is rebuilt from the page's own words rather than taken from
+    `table.extract()`, and this is the difference between a table that searches and
+    one that does not. Extraction inside a ruled cell concatenates the spans it
+    finds without their spaces: the same cell reads "Combinesdense retrieval
+    withsequence generation" through extract() and "Combines dense retrieval with
+    sequence generation" through the word list. The second is what BM25 and the
+    embedding model were trained to read, and the first silently detaches every
+    fused pair from the query that would have found it.
+
+    Every failure degrades to the page as it was indexed before this existed: a
+    detector that raises, a grid that will not read, or a region too small to be a
+    table all leave the prose untouched and say so in the warnings list.
+    """
+    taken = [False] * len(words)
+    try:
+        finder = page.find_tables()
+    except Exception as exc:  # pragma: no cover -- depends on the PDF's internals
+        warnings.append(
+            f"page {page_index}: table detection failed "
+            f"({type(exc).__name__}: {exc}); indexed as plain text"
+        )
+        return [], taken
+
+    found_tables = list(getattr(finder, "tables", []) or [])
+    if not found_tables:
+        return [], taken
+
+    captions = _table_captions(page.get_text("text") or "")
+    tables: list[dict] = []
+
+    for index, found in enumerate(found_tables, start=1):
+        claimed: list[int] = []
+        try:
+            grid = []
+            for row_rects in _cell_rects(found):
+                row = []
+                for box in row_rects:
+                    if box is None:
+                        row.append("")
+                        continue
+                    indices = _claim(words, taken, box)
+                    claimed.extend(indices)
+                    row.append(_words_to_text(words, indices))
+                grid.append(row)
+            grid = _prune_grid(grid)
+        except Exception as exc:  # pragma: no cover -- depends on the PDF's internals
+            _release(taken, claimed)
+            warnings.append(
+                f"page {page_index}: table {index} could not be read "
+                f"({type(exc).__name__}: {exc}); indexed as plain text"
+            )
+            continue
+
+        filled = sum(1 for row in grid for cell in row if cell) if grid else 0
+        markdown = _grid_to_markdown(grid) if grid else ""
+        if (not grid or not markdown
+                or len(grid) < settings.pdf_table_min_rows
+                or len(grid[0]) < settings.pdf_table_min_cols
+                or filled < settings.pdf_table_min_cells):
+            # Too small to be a table, so it stays in the prose, where it reads
+            # better than it would as a two-cell grid. Its words go back first.
+            _release(taken, claimed)
+            continue
+
+        caption = captions.get(index)
+        if caption is None and len(found_tables) == 1 and len(captions) == 1:
+            caption = next(iter(captions.values()))
+
+        tables.append({
+            "text": f"{caption}\n\n{markdown}" if caption else markdown,
+            "section": caption or f"Table {index}",
+            "caption": caption,
+            "index": index,
+            "rows": len(grid),
+            "cols": len(grid[0]),
+            "cells": filled,
+        })
+
+    if not tables:
+        # Nothing was accepted, so nothing may be withheld from the prose.
+        return [], [False] * len(words)
+    return tables, taken
+
+
 def _extract_pdf(path: Path, warnings: list[str]) -> list[Extracted]:
     import pymupdf
 
@@ -203,19 +443,42 @@ def _extract_pdf(path: Path, warnings: list[str]) -> list[Extracted]:
                     ocr_used = True
                     ocr_confidence = round(ocr.confidence, 1)
 
-            if not text:
-                continue
-            for chunk in chunk_blocks(text):
+            # Tables are lifted out after the OCR decision, which has to see the
+            # whole page: a page that is mostly a scanned table must not look
+            # text-rich just because the grid is about to be removed from it.
+            page_tables: list[dict] = []
+            if settings.pdf_table_extraction_enabled:
+                words = page.get_text("words") or []
+                page_tables, taken = _page_tables(page, words, page_index, warnings)
+                if page_tables and not ocr_used:
+                    text = _prose_without(words, taken)
+
+            if text:
+                for chunk in chunk_blocks(text):
+                    out.append((
+                        chunk.text,
+                        SourceLocation(
+                            page_number=page_index,
+                            section=chunk.section or None,
+                        ),
+                        {
+                            "ocr_used": ocr_used,
+                            "ocr_confidence": ocr_confidence,
+                            **chunk.metadata(),
+                        },
+                    ))
+
+            for table in page_tables:
                 out.append((
-                    chunk.text,
-                    SourceLocation(
-                        page_number=page_index,
-                        section=chunk.section or None,
-                    ),
+                    table["text"],
+                    SourceLocation(page_number=page_index, section=table["section"]),
                     {
-                        "ocr_used": ocr_used,
-                        "ocr_confidence": ocr_confidence,
-                        **chunk.metadata(),
+                        "is_table": True,
+                        "table_index": table["index"],
+                        "table_rows": table["rows"],
+                        "table_cols": table["cols"],
+                        "table_cells": table["cells"],
+                        "table_caption": table["caption"],
                     },
                 ))
     return out

@@ -3,6 +3,11 @@
 Everything below was executed and measured on the build in this zip. Numbers quoted
 are real run outputs, not targets.
 
+**Printing one page?** `DEMO_CUE_CARD.md` is this runbook reduced to what you need in
+your hand: the seven questions in order, what each one costs in seconds, the lines to
+say, and what to do if the room goes quiet. It was measured against a copy of this
+archive unpacked into a clean directory, not against the working tree.
+
 ---
 
 ## 1. What your laptop needs (prerequisites)
@@ -87,27 +92,36 @@ ingest, delete sources, manage collections, export history, manage accounts).
 ## 4. Verify before you walk in (2 minutes)
 
 ```powershell
-python scripts\selftest.py       # 86 offline checks: guards, parents, trace, manifest
-python scripts\apitest.py        # 30 offline checks: the API and the React UI
+python scripts\selftest.py       # 258 offline checks: guards, collections, tables, context
+python scripts\apitest.py        # 78 offline checks: the API and the React UI
+python scripts\apitest.py --with-query   # 88 checks, including the streaming route
 python scripts\verify_env.py     # every import resolves, binaries reachable, audio decodes
 python scripts\smoke_test.py     # 4 end-to-end questions + a real abstention
 python scripts\verify_offline.py # blocks all non-loopback sockets, then answers
-python evaluation.py --compare   # the regression gate against evaluation\baseline.json
+python evaluation.py --retrieval-only --compare   # fast gate, 33 s, no LLM needed
+python evaluation.py --compare   # the full regression gate against evaluation\baseline.json
 ```
 
-Expected, all of it measured on this build (index 6 sources / 37 items / 43 relationships):
+Expected, all of it measured on this build (index 6 sources / 36 items / 41 relationships):
 
 | Command | Result | Exit |
 |---|---|---|
-| `scripts\selftest.py` | **86/86 checks passed** — no LLM, no network, throwaway index | 0 |
-| `scripts\apitest.py` | **30/30 checks** on the API and the React UI it serves — first-run bootstrap, login, roles, lockout, `/ui` assets, manifest. No server, no model | 0 |
+| `scripts\selftest.py` | **258/258 checks passed** — no LLM, no network, throwaway index | 0 |
+| `scripts\verify_kit.py` | **10/10 checks** on the archive you installed from — run this first, on any machine, before the environment exists | 0 |
+| `scripts\apitest.py` | **78/78 checks** on the API and the React UI it serves — first-run bootstrap, login, roles, lockout, `/ui` assets, chat history, the 429 path, manifest, collections, and a final assertion that the accounts, the history and the index are exactly as the suite found them. No server, no model | 0 |
 | `scripts\verify_env.py` | `Environment verified - all required imports succeeded` (pyttsx3 optional) | 0 |
 | `scripts\smoke_test.py` | **4/4** questions answered, abstention correct | 0 |
+| `scripts\dump_chunks.py --all` | 6 indexed sources with their chunk counts — the fastest way to confirm the index is the corpus you think it is | 0 |
 | `scripts\verify_offline.py` | `none - every socket stayed on loopback` → `Offline verification PASSED` | 0 |
-| `evaluation.py --compare` | **16 PASS / 0 CHECK** on dataset v2.0, `PASS: no gated metric regressed` (report `report_20261105_200057`) | 0 |
+| `evaluation.py --retrieval-only --compare` | **15 PASS / 0 CHECK / 1 UNDECIDED** in 33 s, retrieval metrics identical to the full run. The undecided row is Q9, whose refusal comes from the post-generation temporal guard — reported, not guessed | 0 |
+| Fresh install from this archive | unpacked into a clean directory, `.env` copied from `.env.example`, index built by `ingest_demo.py` in **28 s**: `verify_kit.py` **12/12** with `--extract`, `selftest.py` **258/258**, `apitest.py` **78/78 on its first run against that index**, `smoke_test.py` **4/4**, `verify_offline.py` PASSED, and `evaluation.py --compare` **16 PASS / 0 gated failures** with **all ten gated metrics identical** to `report_20261106_000901` (`report_20261106_011329`). Latency differs and should: 10.69 s mean with the model resident, against 15.77 s in the record where `OLLAMA_KEEP_ALIVE=0` unloaded it between questions |
+| `evaluation.py --compare` after round 3 | exit 0 — **16 PASS / 0 CHECK**, 0 gated failures, clean tree at `09caf60`, and **every gated metric identical** to `report_20261106_000901`. The streaming route changed when tokens arrive, not what the answer is (`report_20261106_014909`) |
+| `evaluation.py --compare` | **16 PASS / 0 CHECK** on dataset v2.0, `PASS: no gated metric regressed`, retrieval precision 0.3531, citation accuracy 0.5635, no per-query regression to report (report `report_20261106_000901`, commit `1fac077`, clean tree) | 0 |
 
 `selftest.py` is the one to run in the room if a laptop has not finished downloading
-models: it needs nothing but Python and the repository.
+models: it needs nothing but Python and the repository. `evaluation.py
+--retrieval-only` is the next cheapest real check — it needs the index but no LLM,
+so it still works if Ollama has not started, and it takes half a minute.
 
 ---
 
@@ -125,10 +139,18 @@ all, rather than seeing it fail."*
 **2. Text evidence.** Ask:
 > How many records did the ingestion platform process in 2024?
 
-Expected: **"1.2 million records"**, cited to `project_report.pdf - Page 2`. Then
-**click the [1] in the answer**: the evidence block scrolls into view and outlines
-itself; click it again to release. Say: *"Interactive citations — the claim and the
-sentence it came from are one click apart, in both directions."*
+Expected: **"1.2 million records"**, cited to `project_report.pdf - Page 2` among five
+citations. Then **click a citation**: the evidence block scrolls into view and outlines
+itself; click it again to release.
+
+Where to click depends on the model. If the answer prose carries inline `[1]` markers,
+those are buttons. A small model often emits none — `qwen2.5:0.5b` did not in rehearsal —
+and the **numbered chips directly under the answer are there either way**, as are the
+chips on each evidence block. All three drive the same selection. Do not promise the
+audience an inline marker before you have looked at the answer.
+
+Say: *"Interactive citations — the claim and the sentence it came from are one click
+apart, in both directions."*
 
 **3. Image evidence (OCR).** Ask:
 > What does the project dashboard show about team size?
@@ -176,12 +198,44 @@ fire when they should and stay silent when they should not. Do not stage a quest
 hoping for a warning: whether the 0.5b model invents a number on a given run is not
 yours to control, and a demo that promises a failure is a demo that can fail to fail.
 
-**8. Sources panel.** Six indexed sources with type, collection and size; admin-only
-delete; and the **stale-version banner** that appears when a filename has more than one
+**8. Sources and collections panel.** Start with the **Add documents** card and drop a
+file on it. The queue gives every file its own row and its own outcome — items
+indexed, warnings listed, or the reason it failed — because a batch upload that
+reports "finished" does not report which PDF was password protected. Drag something
+unacceptable in (a `.zip`) to show that a rejected file becomes a named row with a
+reason rather than quietly disappearing. The formats that card accepts are read from
+`GET /manifest`, not written into the page, so the drop zone cannot promise what the
+server would refuse. Press **?** for the shortcuts: Alt+1..4 moves between tabs,
+Ctrl+K jumps to the question box — worth knowing live, because it means never
+hunting for a tab in front of an audience. Then the **Collections** card: declare a
+collection, file a source under it with the dropdown in the source table, then ask a
+question scoped to it on the Ask tab — and say what deleting a collection does, because
+everybody assumes the wrong thing: *"Deleting this group moves its two documents back to
+`general`. It deletes nothing, and it does not re-index anything, because a collection is
+a label on a source row."* Then the source table: six indexed sources with type,
+collection and size; admin-only delete; and the **stale-version banner** that appears when a filename has more than one
 indexed version, newest marked, older ones removable in one click. Say: *"Re-uploading a
 changed file used to leave the old version citable beside the new one, with nothing in
 any UI to tell you. Now the system says so and offers the cleanup."* Deleting rebuilds
 the vector index rather than leaving dangling ids.
+
+Last thing on this panel, and it is a good one — what the indexer actually made of a
+PDF:
+
+```powershell
+python scripts\dump_chunks.py --source MCA_MP_58-mini-project.pdf
+```
+
+Two of the deck's chunks are markdown grids, lifted off pages 4 and 5. Say: *"Plain
+text extraction reads a table in block order, so one row's cells end up in different
+chunks — a paper's name beside a diagram caption, its finding three chunks away. We
+detect the ruled region and index it as a grid instead, so a row stays a row. On our
+own harness that moved the deck question from retrieving three items for one answer
+to retrieving exactly the right one."* If somebody asks what happens when the detector
+gets it wrong: *"A region has to reach two rows, two columns and three filled cells
+before it is treated as a table, and every word it claimed goes back to the page text
+if it is then rejected. The self-test checks that word by word against this deck, so
+nothing is quietly withheld from the index."*
 
 **9. Health & build.** Show the runtime block (git commit, clean/dirty tree, CPU, RAM,
 disk free, uptime, every guard flag) and expand the **full run manifest**. Say: *"Any
@@ -189,9 +243,16 @@ answer, and any evaluation score, traces back to the exact build that produced i
 commit, models, thresholds, dataset version. The same manifest is embedded in every
 report."*
 
-**10. History (Streamlit, :8501).** Replay an earlier question: it renders the **stored
-pipeline trace** as recorded, plus what was retrieved, reranked and cited. Exportable to
-Markdown/CSV. Auditable answers, not just answers.
+**10. History — the audit trail, in the same browser tab.** Open the **History** tab in
+the React UI. Every conversation you ran in steps 4-8 is listed; open one and each answer
+renders with the **stored pipeline trace** as it was recorded, the citations, and any
+figure the numeric guard could not verify. Say: *"This was asked twenty minutes ago and
+nothing about it has been re-computed — the trace you are looking at is the one the
+answer was produced with. If the corpus changes next week, this record does not."* With
+an admin account, export it to Markdown or CSV and hand the file to the jury: a reviewer
+who will never sign in can still read the provenance. The Streamlit operator UI at :8501
+replays exactly the same records, because both front ends write through one API and one
+database. Auditable answers, not just answers.
 
 **11. Close with the harness.**
 ```powershell
@@ -200,6 +261,16 @@ python evaluation.py --compare
 *"Sixteen fixed queries, deterministic metrics, and a regression gate that fails the
 build if any gated metric drops. That is how we found and reverted our own prompt change
 and our own chunking change — both are recorded in the guide, with the numbers."*
+
+If somebody asks whether the current retrieval techniques were tried, this is the answer,
+and it is a stronger one than a feature list: *"Contextual retrieval — a per-chunk blurb
+from the model, prepended to what gets embedded. We implemented it and measured it against
+the same sixteen queries with the flag off and on. Retrieval precision went .353 to .382
+and groundedness to 1.0, but answer correctness went 1.0 to .979, because one query
+answered both of its hops in better prose and dropped the figure the dataset requires. It
+ships off, both runs are in the repository, and the blurb never touches a citation — it is
+prepended to the indexed text only."* The two reports are `report_20261105_215324` (off)
+and `report_20261105_223230` (on) in `evaluation\reports\`.
 
 ---
 
@@ -217,6 +288,7 @@ and our own chunking change — both are recorded in the guide, with the numbers
 | React UI is blank or 404 | `webui\dist` is missing: `cd webui && npm install && npm run build` (Node 18+) |
 | React UI says 401 after a while | The token was revoked or the account deleted: sign in again |
 | `/login` answers 423 | Account locked after five failures: wait 5 minutes, or `scripts\create_user.py <name> <new-password> --set-password` |
+| A request answers **429** | The rate limiter: 30 questions/minute with a burst of 6, 60 ingestions/minute with a burst of 20 (`RATE_LIMIT_*` in `.env`). Wait the seconds named in the `Retry-After` header. A presenter clicking through demo questions does not hit this; a retry loop or a folder of 50 PDFs dropped twice does |
 | It refuses questions it should answer | Open the pipeline trace and read the **decisive check** row — it names the guard. Then check `ABSTENTION_THRESHOLD` / `_IMAGE` |
 
 **Demo-safe fallback:** steps 2, 5 and 6 are the core story and each takes one question.

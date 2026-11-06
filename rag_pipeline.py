@@ -57,6 +57,12 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 
 
+# The answer field of a retrieval-only response. It is a label rather than an
+# empty string so that a response produced without generation cannot be mistaken
+# for one that generated nothing.
+RETRIEVAL_ONLY_MARKER = "[retrieval-only] generation was not run"
+
+
 def _safe_name(filename: str) -> str:
     """Strip any directory component so an upload cannot traverse paths."""
     return Path(filename).name.replace("\\", "_").replace("/", "_")
@@ -278,6 +284,20 @@ class RAGPipeline:
                     self.store.add_parents(parents)
                     result.parents = parents
 
+            if settings.contextual_retrieval_enabled:
+                from contextual import annotate_items
+
+                # Before embedding, and only here: the blurb is an ingest-time
+                # annotation, persisted with the item's metadata so it survives a
+                # restart instead of being recomputed per query. Turning the flag on
+                # without reindexing does nothing to an existing corpus, because
+                # there is nothing to prepend.
+                annotate_items(
+                    result.items,
+                    result.source.filename,
+                    warnings=result.warnings,
+                )
+
             vectors = embed_items(result.items)
             stored = self.store.add_items(result.items, vectors)
 
@@ -411,6 +431,43 @@ class RAGPipeline:
             yield self._observe(grounded)
             return
         yield from self._finish_stream(grounded)
+
+    def query_retrieval_only(self, request: QueryRequest, backend=None) -> QueryResponse:
+        """Steps 1-5b and no further: representation, retrieval, rerank, gates.
+
+        Returns a QueryResponse carrying the retrieved items, relationships,
+        confidence and timings, with `answer` set to RETRIEVAL_ONLY_MARKER. When a
+        pre-generation check refuses the question, that refusal comes back exactly
+        as a real query would return it -- same error code, same stage trace.
+
+        This exists for the harness's fast gate (`evaluation.py --retrieval-only`),
+        which checks retrieval quality on CPU in seconds with no Ollama and no GPU.
+        The only honest way to build such a gate is to run the real code path up to
+        where generation would start; a second, parallel retrieval implementation
+        would drift, and a gate that measures something other than what ships is
+        worse than no gate at all.
+
+        The result is not an answer and must not be shown as one. It has no
+        citations, because citations are built by matching answer text to evidence,
+        and nothing downstream of generation has run: no numeric guard, no evidence
+        completion, no temporal correction, no repetition collapse.
+        """
+        grounded = self._ground(request, backend)
+        if isinstance(grounded, QueryResponse):
+            return self._observe(grounded)
+
+        state = grounded
+        state["timings"]["total_ms"] = (time.perf_counter() - state["started"]) * 1000
+        _count(outcome="retrieval only (generation not run)")
+        return self._observe(QueryResponse(
+            answer=RETRIEVAL_ONLY_MARKER,
+            retrieved_items=state["reranked"],
+            relationships=state["relationships"],
+            abstained=False,
+            confidence=state["confidence"],
+            query_representation=state["representation"],
+            latency_ms=state["timings"],
+        ))
 
     def _ground(self, request: QueryRequest, backend=None):
         """Steps 1-5b: representation, retrieval, rerank, gates, evidence.

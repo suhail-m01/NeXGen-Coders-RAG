@@ -8,7 +8,7 @@ import react from '@vitejs/plugin-react'
 // portable and offline.
 const API_PATHS = [
   '/query', '/query_file', '/ingest', '/sources', '/source', '/health',
-  '/manifest', '/login', '/logout', '/me', '/bootstrap',
+  '/manifest', '/login', '/logout', '/me', '/bootstrap', '/history', '/collections',
 ]
 
 export default defineConfig({

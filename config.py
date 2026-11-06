@@ -149,6 +149,66 @@ class Settings(BaseSettings):
     # that small carries a heading but not the sentence that answers anything.
     structure_min_chunk_chars: int = 200
 
+    # ---- PDF tables ---------------------------------------------------
+    # Lift a detected table out of a PDF page and index it as a markdown grid
+    # instead of leaving it to plain text extraction. Plain extraction reads a
+    # table in block order, which on a real page scatters one row across several
+    # blocks: on the demo deck's literature survey the number, the paper title
+    # and that row's findings land in different chunks, so a question about one
+    # row retrieves a fragment of it. The grid keeps a row together.
+    #
+    # On by default because it was measured, not because it sounds good. Same
+    # corpus, same 16 queries, flag off then on: retrieval precision .3115 ->
+    # .3531, citation accuracy .551 -> .5635, and Q16 (asked of the slide deck)
+    # went from retrieving three items for one answer to retrieving exactly the
+    # right one, P .33 -> 1.00 with its citation .80 -> 1.00. Everything else was
+    # unchanged, and the run held 16 PASS / 0 CHECK. It also retired the last
+    # reported-only per-query regression in the gate.
+    #
+    # The bounded risk, stated plainly: PyMuPDF's detector is a layout heuristic,
+    # so on a scanned or heavily ruled page it can call prose a table and move real
+    # sentences into a grid. Three size floors below reject the small cases, and
+    # words are claimed one cell at a time and handed back whenever a candidate is
+    # rejected, so nothing is withheld from the page -- a mis-detected region reads
+    # worse, it does not read missing. `scripts/selftest.py` asserts that property
+    # word by word against the shipped deck. Set this to false and run
+    # scripts/reindex.py to go back to plain page text.
+    pdf_table_extraction_enabled: bool = True
+    # A detected region has to look like a table before it is treated as one.
+    # These floors are what keeps a two-column paragraph from being lifted out of
+    # the prose: it comes back as 2x2 with two filled cells and stays where it is.
+    pdf_table_min_rows: int = 2
+    pdf_table_min_cols: int = 2
+    pdf_table_min_cells: int = 3
+
+    # ---- Contextual retrieval -----------------------------------------
+    # One local LLM call per chunk at ingest writes a sentence or two saying where
+    # the chunk sits in its document, and that sentence is prepended to the text
+    # that gets embedded and lexically indexed (contextual.py). Anthropic's
+    # contextual retrieval, September 2024.
+    #
+    # Off by default, and the decision is measured on this corpus rather than
+    # argued: see §10 of WINDOWS_SETUP_GUIDE.md for both evaluation runs. The blurb
+    # never reaches a screen -- `ContentItem.content` is untouched, and citations,
+    # excerpts and every guard read `content` -- so the worst a bad blurb can do is
+    # mis-rank retrieval. What it always costs is one generation per chunk at
+    # ingest, which is why this is a per-corpus decision and not a free switch.
+    contextual_retrieval_enabled: bool = False
+    # How much of the document is sent with each chunk. It has to fit the model's
+    # window beside the chunk and the reply: 12,000 characters is roughly 3,000
+    # tokens, which leaves room in a 4,096-token context and is a quarter of an
+    # 8,192-token one. Head and tail are kept, not just the head.
+    contextual_document_chars: int = 12000
+    # Cap on the reply. A blurb is a sentence or two; an uncapped small model asked
+    # for one will keep going.
+    contextual_max_tokens: int = 60
+    # Cap on what is stored and indexed, cut at a word boundary.
+    contextual_max_chars: int = 300
+    # A source with fewer items than this is skipped: one chunk is the whole
+    # document, so there is nothing to situate it in and the blurb could only
+    # paraphrase the text it is attached to.
+    contextual_min_items: int = 2
+
     # ---- Retrieval ----------------------------------------------------
     top_k: int = 10
     rerank_top_k: int = 5
@@ -276,6 +336,28 @@ class Settings(BaseSettings):
     # ---- Ingestion limits (security) -----------------------------------
     max_file_bytes: int = 200 * 1024 * 1024
     max_query_chars: int = 2000
+
+    # ---- Rate limiting (model-running routes only) --------------------
+    # Token bucket on /query, /query_file and /ingest, which are the routes that
+    # load and run local models. Read-only endpoints (/health, /sources,
+    # /manifest, /history) are not limited. `burst` requests may arrive at once,
+    # after which the per-minute rate refills the bucket. An /ingest request is
+    # charged one token per file. Counted in process memory, so two uvicorn
+    # workers mean twice the effective limit -- see rate_limit.py.
+    # The defaults are deliberately generous: a presenter clicking through demo
+    # questions, or a folder of slides dropped on the upload box, must not meet a
+    # 429. What they stop is a retry loop or a polling client hammering a service
+    # where every call costs seconds of GPU time.
+    rate_limit_enabled: bool = True
+    rate_limit_queries_per_minute: float = 30.0
+    rate_limit_queries_burst: int = 6
+    rate_limit_ingest_per_minute: float = 60.0
+    rate_limit_ingest_burst: int = 20
+    # Only turn this on behind a proxy that you control and that sets
+    # X-Forwarded-For. Off means the socket peer is the client. On means the
+    # rightmost forwarded hop is, which is the only entry in that header a client
+    # cannot forge; anything to its left is whatever the client chose to send.
+    rate_limit_trust_forwarded_for: bool = False
 
     # ---- Paths ---------------------------------------------------------
     data_dir: Path = PROJECT_ROOT / "data"

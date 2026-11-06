@@ -20,6 +20,27 @@ Regression gate:
     Comparing across dataset versions is refused unless you pass
     --allow-dataset-mismatch, because the numbers would not mean the same thing.
 
+Fast gate:
+    --retrieval-only runs the same queries through representation, retrieval,
+    reranking and the pre-generation guards, and stops there. No LLM is called,
+    so it needs no Ollama and no GPU and finishes in seconds instead of minutes,
+    which is what makes it usable on every commit rather than only before a
+    release. It is honest about the trade: answer-level metrics are absent from
+    its report rather than reported as zero, its files are named
+    report_<timestamp>_retrieval.*, it refuses to be promoted to a baseline, and
+    --compare against a full baseline narrows itself to precision, recall and MRR
+    and says so in the headline. A question the dataset expects to be refused but
+    that no guard caught is reported UNDECIDED, not as a pass: the refusal may
+    legitimately come from the model, which this mode never runs.
+
+Latency:
+    Every report carries n, mean, min, p50, p95 and max. The mean alone was
+    misleading -- 11.0 s mean with a 27.9 s maximum, the first query loading
+    three models -- and the maximum is what a person demoing the system actually
+    experiences. Percentiles are nearest-rank order statistics over the run
+    itself, so with 16 queries p95 is the slowest query; the report says that
+    instead of letting "p95" imply a distribution nobody sampled.
+
 Determinism, stated honestly:
     Retrieval, reranking, relationships and citations are deterministic --
     identical inputs give identical outputs on every run.
@@ -38,6 +59,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import subprocess
 import sys
 import time
@@ -131,6 +153,128 @@ def hallucinated_numbers(answer: str, evidence_text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
+def latency_stats(values: list) -> dict:
+    """Nearest-rank percentiles over the run's per-query latencies.
+
+    A mean is not a latency report. On the run this was written against the mean
+    was 11.0 s while the slowest query took 27.9 s -- the first one, which loads
+    the embedding model, the reranker and the language model. Averaging that spike
+    into fifteen warm queries produces a number no user ever experiences: the
+    person demoing the system experiences the maximum, and the person reading a
+    report needs both.
+
+    These are order statistics, not interpolated percentiles, and the sample is the
+    run itself: with 16 queries the 95th percentile *is* the slowest query, which
+    the report says out loud rather than leaving "p95" to imply a distribution
+    nobody sampled. Latency stays informational in the gate -- it measures the
+    machine, and failing a correct change because it ran on a slower laptop would
+    teach people to ignore the gate.
+    """
+    sample = sorted(float(v) for v in values if isinstance(v, (int, float)))
+    if not sample:
+        return {"n": 0, "mean_s": 0.0, "min_s": 0.0, "p50_s": 0.0, "p95_s": 0.0,
+                "max_s": 0.0, "method": "no samples"}
+
+    count = len(sample)
+
+    def rank(percentile: float) -> int:
+        return max(0, min(count - 1, math.ceil(percentile * count) - 1))
+
+    p50_index, p95_index = rank(0.50), rank(0.95)
+    stats = {
+        "n": count,
+        "mean_s": round(sum(sample) / count, 4),
+        "min_s": round(sample[0], 4),
+        "p50_s": round(sample[p50_index], 4),
+        "p95_s": round(sample[p95_index], 4),
+        "max_s": round(sample[-1], 4),
+        "method": "nearest rank over this run's queries, no interpolation",
+    }
+    if p95_index == count - 1:
+        stats["note"] = (
+            f"n={count}: the 95th percentile is the slowest query in the run"
+        )
+    return stats
+
+
+# Metrics that cannot exist without a generated answer. A retrieval-only run
+# omits them from its aggregate rather than reporting 0.0: a zero in a report
+# reads as a catastrophic failure, and "not measured" is not a failure.
+SKIPPED_WITHOUT_GENERATION = (
+    "citation_accuracy", "answer_correctness", "groundedness", "hallucination_rate",
+    "numeric_guard_rate", "forbidden_leak_rate", "abstention_accuracy",
+)
+# What a retrieval-only run may still be compared on, and what it may not.
+RETRIEVAL_ONLY_COMPARABLE = ("retrieval_precision", "retrieval_recall", "mrr")
+RETRIEVAL_ONLY_PER_QUERY = ("precision", "recall", "mrr")
+RETRIEVAL_ONLY_PER_MODALITY = ("retrieval_recall",)
+
+
+def _mean_field(rows: list, field: str) -> float:
+    values = [r[field] for r in rows if isinstance(r.get(field), (int, float))]
+    return round(sum(values) / len(values), 4) if values else 0.0
+
+
+def _decision_note(response) -> str:
+    """The decisive pre-generation check, read back out of the stage trace."""
+    for entry in (response.stages or []):
+        if isinstance(entry, dict) and entry.get("stage") == "decision":
+            return str(entry.get("note") or "")
+    return ""
+
+
+def _retrieval_only_record(spec: dict, response, retrieved_files: list,
+                           precision: float, recall: float, mrr: float,
+                           latency: float) -> dict:
+    """One query scored on retrieval and on the pre-generation decision only.
+
+    Three outcomes, and the third is the honest one. A question the dataset
+    expects to be refused may be refused by a guard before generation -- decided,
+    and checkable here -- or by the model itself saying it has insufficient
+    evidence, which this mode never runs. The second case is reported as
+    UNDECIDED rather than as a failure or a pass, because claiming either would be
+    inventing a result.
+    """
+    expects_abstention = bool(spec["expect_abstention"])
+    if response.abstained:
+        decision, preflight_correct = "refused before generation", expects_abstention
+    elif expects_abstention:
+        decision, preflight_correct = "would answer -- undecided", None
+    else:
+        decision, preflight_correct = "would answer", True
+
+    found_evidence = recall > 0 or not spec["expected_sources"]
+    if preflight_correct is None:
+        status = "UNDECIDED"
+    elif preflight_correct and found_evidence:
+        status = "PASS"
+    else:
+        status = "CHECK"
+
+    return {
+        "id": spec["id"],
+        "query": spec["query"],
+        "expected_sources": spec["expected_sources"],
+        "retrieved_sources": retrieved_files,
+        "modalities": sorted({r.item.modality.value for r in response.retrieved_items}),
+        "abstained": bool(response.abstained),
+        "expect_abstention": expects_abstention,
+        "preflight_decision": decision,
+        "preflight_correct": preflight_correct,
+        "decision": _decision_note(response),
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "mrr": round(mrr, 4),
+        "expected_modality": spec["expected_modality"],
+        "tags": spec.get("tags", []),
+        "notes": spec.get("notes", ""),
+        "confidence": response.confidence,
+        "latency_s": round(latency, 2),
+        "status": status,
+        "answer": response.answer,
+    }
+
 
 def default_dataset() -> dict:
     """The fixed evaluation set, and the source of truth for queries.json.
@@ -480,24 +624,36 @@ def git_commit() -> str:
     return value if value != "unknown" else "unversioned"
 
 
-def run_evaluation(judge: bool = False) -> dict:
+def run_evaluation(judge: bool = False, retrieval_only: bool = False) -> dict:
     from rag_pipeline import get_pipeline
+
+    if judge and retrieval_only:
+        raise ValueError(
+            "--judge needs answers to judge; --retrieval-only never generates any."
+        )
 
     dataset = load_dataset()
     pipeline = get_pipeline()
     per_query: list[dict] = []
 
     print(f"Evidence AI evaluation -- dataset v{dataset['dataset_version']}")
+    if retrieval_only:
+        print("MODE: retrieval-only. No generation, so no LLM and no GPU: this "
+              "scores retrieval, reranking and the pre-generation guards only.")
     print("=" * 78)
 
     for spec in dataset["queries"]:
         started = time.perf_counter()
-        response = pipeline.query(QueryRequest(
+        request = QueryRequest(
             query=spec["query"],
             top_k=settings.top_k,
             rerank_top_k=settings.rerank_top_k,
             query_modality=QueryModality(spec["query_modality"]),
-        ))
+        )
+        response = (
+            pipeline.query_retrieval_only(request) if retrieval_only
+            else pipeline.query(request)
+        )
         latency = time.perf_counter() - started
 
         retrieved_files, seen = [], set()
@@ -513,6 +669,18 @@ def run_evaluation(judge: bool = False) -> dict:
 
         precision, recall = precision_recall(retrieved_files, expected)
         mrr = reciprocal_rank(retrieved_files, expected)
+
+        if retrieval_only:
+            record = _retrieval_only_record(
+                spec, response, retrieved_files, precision, recall, mrr, latency
+            )
+            per_query.append(record)
+            note = f" -- {record['decision']}" if record["decision"] else ""
+            print(f"[{record['status']:9s}] {spec['id']:18s} P={precision:.2f} "
+                  f"R={recall:.2f} MRR={mrr:.2f} "
+                  f"{record['preflight_decision']}{note} {latency:.1f}s")
+            continue
+
         correctness = keyword_coverage(
             response.answer,
             spec["answer_keywords"],
@@ -568,9 +736,19 @@ def run_evaluation(judge: bool = False) -> dict:
                     spec["query"], response.answer, evidence_text
                 ).as_record()
 
+        # Computed before the record and stored in it, not only printed. The CSV writer
+        # has always advertised a `status` column and full-mode records never filled it,
+        # so anyone reading a report had to re-derive the verdict from three other
+        # fields - and get the rule exactly right. Same expression as the console line
+        # below, in the one place it now lives.
+        status = (
+            "PASS" if abstention_ok and correctness >= 0.5 and not forbidden
+            else "CHECK"
+        )
         record = {
             "id": spec["id"],
             "query": spec["query"],
+            "status": status,
             "expected_sources": expected,
             "retrieved_sources": retrieved_files,
             "citation_sources": citation_files,
@@ -598,10 +776,6 @@ def run_evaluation(judge: bool = False) -> dict:
             record.update(record_judge)
         per_query.append(record)
 
-        status = (
-            "PASS" if abstention_ok and correctness >= 0.5 and not forbidden
-            else "CHECK"
-        )
         guard = f" guard={','.join(flagged)}" if flagged else ""
         if forbidden:
             guard += f" LEAK={','.join(forbidden)}"
@@ -613,8 +787,13 @@ def run_evaluation(judge: bool = False) -> dict:
               f"cite={cite_accuracy:.2f}{guard} {latency:.1f}s")
 
     def mean(field: str) -> float:
-        values = [r[field] for r in per_query if isinstance(r[field], (int, float))]
+        # .get() rather than []: a retrieval-only record has no answer fields at
+        # all, and the aggregates below are built before the unmeasurable ones are
+        # dropped from the report.
+        values = [r[field] for r in per_query if isinstance(r.get(field), (int, float))]
         return round(sum(values) / len(values), 4) if values else 0.0
+
+    latency = latency_stats([r["latency_s"] for r in per_query])
 
     aggregate = {
         "retrieval_precision": mean("precision"),
@@ -624,24 +803,35 @@ def run_evaluation(judge: bool = False) -> dict:
         "answer_correctness": mean("answer_correctness"),
         "groundedness": mean("groundedness"),
         "hallucination_rate": round(
-            sum(1 for r in per_query if r["hallucinated_numbers"]) / len(per_query), 4
+            sum(1 for r in per_query if r.get("hallucinated_numbers")) / len(per_query), 4
         ),
         "abstention_accuracy": round(
-            sum(1 for r in per_query if r["abstention_correct"]) / len(per_query), 4
+            sum(1 for r in per_query if r.get("abstention_correct")) / len(per_query), 4
         ),
         # How often the numeric guard had to caveat an answer. Not a quality
         # score on its own: a higher rate can mean better honesty or worse OCR.
         "numeric_guard_rate": round(
-            sum(1 for r in per_query if r["unverified_numbers"]) / len(per_query), 4
+            sum(1 for r in per_query if r.get("unverified_numbers")) / len(per_query), 4
         ),
         # Adversarial queries: how often the answer contained a phrase the
         # dataset says must never appear (a wrong year's figure, an invented
         # currency amount, another project's headcount).
         "forbidden_leak_rate": round(
-            sum(1 for r in per_query if r["forbidden_hits"]) / len(per_query), 4
+            sum(1 for r in per_query if r.get("forbidden_hits")) / len(per_query), 4
         ),
         "mean_latency_s": mean("latency_s"),
+        "p50_latency_s": latency["p50_s"],
+        "p95_latency_s": latency["p95_s"],
     }
+
+    if retrieval_only:
+        for metric in SKIPPED_WITHOUT_GENERATION:
+            aggregate.pop(metric, None)
+        decided = [r for r in per_query if r["preflight_correct"] is not None]
+        aggregate["preflight_refusal_accuracy"] = (
+            round(sum(1 for r in decided if r["preflight_correct"]) / len(decided), 4)
+            if decided else 0.0
+        )
 
     # Per-modality means. An aggregate over a mixed set can hide a modality that
     # quietly collapsed -- image queries failing while text carries the average is
@@ -649,6 +839,21 @@ def run_evaluation(judge: bool = False) -> dict:
     per_modality: dict[str, dict] = {}
     for modality in sorted({r["expected_modality"] for r in per_query}):
         rows = [r for r in per_query if r["expected_modality"] == modality]
+
+        if retrieval_only:
+            decided = [r for r in rows if r["preflight_correct"] is not None]
+            per_modality[modality] = {
+                "queries": len(rows),
+                "retrieval_recall": _mean_field(rows, "recall"),
+                "retrieval_precision": _mean_field(rows, "precision"),
+                "mrr": _mean_field(rows, "mrr"),
+                "preflight_accuracy": (
+                    round(sum(1 for r in decided if r["preflight_correct"]) / len(decided), 4)
+                    if decided else 0.0
+                ),
+                "undecided": len(rows) - len(decided),
+            }
+            continue
 
         def mod_mean(field: str, rows: list[dict] = rows) -> float:
             values = [r[field] for r in rows if isinstance(r[field], (int, float))]
@@ -730,8 +935,23 @@ def run_evaluation(judge: bool = False) -> dict:
                 "local model (3B+) for the judge arm."
             )
 
+    undecided = [r["id"] for r in per_query if r.get("preflight_correct") is None]
+    checks = [r["id"] for r in per_query if r.get("status") == "CHECK"]
+    scope_note = (
+        "RETRIEVAL-ONLY RUN. Nothing was generated: no LLM was called, so answer "
+        "correctness, citation accuracy, groundedness, hallucination and "
+        "forbidden-phrase leakage were not measured and are absent from this "
+        "report rather than reported as zero. What was measured is retrieval, "
+        "reranking and the guards that run before generation. A pass here says the "
+        "evidence was found and the pre-generation decision was right; it says "
+        "nothing about whether the answer would have been correct."
+        if retrieval_only else
+        "FULL RUN. Retrieval, guards, generation and answer scoring, with the LLM."
+    )
+
     return {
         "dataset_version": dataset["dataset_version"],
+        "mode": "retrieval-only" if retrieval_only else "full",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "git_commit": git_commit(),
         # Self-describing runs: the exact build, configuration and index behind
@@ -769,6 +989,13 @@ def run_evaluation(judge: bool = False) -> dict:
         },
         "index": pipeline.store.stats(),
         "aggregate": aggregate,
+        "latency": latency,
+        "scope_note": scope_note,
+        **({
+            "skipped_metrics": list(SKIPPED_WITHOUT_GENERATION),
+            "undecided_queries": undecided,
+            "check_queries": checks,
+        } if retrieval_only else {}),
         "per_modality": per_modality,
         "dataset_coverage": dataset_coverage,
         "per_query": per_query,
@@ -783,9 +1010,16 @@ def run_evaluation(judge: bool = False) -> dict:
             "noise. Deterministic metrics (keyword coverage, number checks, "
             "retrieval set math) remain the score of record."
             if judge else
+            "Not applicable: a retrieval-only run generates no answer to judge."
+            if retrieval_only else
             "LLM judge not run. Pass --judge to add advisory judge columns."
         ),
         "determinism_note": (
+            "Retrieval, reranking, relationships and the pre-generation guards are "
+            "deterministic, and nothing else runs in this mode, so a retrieval-only "
+            "report is reproducible on any machine with the same index -- no seed "
+            "and no Ollama involved. Latency is the exception: it measures the host."
+            if retrieval_only else
             "Retrieval, reranking, relationships and citations are deterministic. "
             "Generation runs at temperature 0.0 with a fixed seed (ollama_seed), "
             "which makes answer-level metrics reproducible run-to-run; set "
@@ -841,9 +1075,30 @@ def compare_reports(current: dict, baseline: dict, tolerance: float = 0.0,
     rows: list[dict] = []
     regressions: list[str] = []
 
+    # A retrieval-only run has no answer metrics, so it can only be compared on
+    # what it measured. The comparison is narrowed rather than skipped: retrieval
+    # regressions are worth catching in twenty seconds, and pretending the run
+    # gated answer quality would be the actual failure mode here.
+    mode = current.get("mode", "full")
+    base_mode = baseline.get("mode", "full")
+    restricted = mode == "retrieval-only" or base_mode == "retrieval-only"
+    gated_set = (
+        {name: GATED_METRICS[name] for name in RETRIEVAL_ONLY_COMPARABLE}
+        if restricted else dict(GATED_METRICS)
+    )
+    per_query_set = RETRIEVAL_ONLY_PER_QUERY if restricted else PER_QUERY_GATED
+    modality_set = (
+        {name: PER_MODALITY_GATED[name] for name in RETRIEVAL_ONLY_PER_MODALITY}
+        if restricted else dict(PER_MODALITY_GATED)
+    )
+    informational_set = (
+        tuple(m for m in INFORMATIONAL_METRICS if "latency" not in m)
+        if restricted else tuple(INFORMATIONAL_METRICS)
+    )
+
     base_agg = baseline.get("aggregate", {})
     cur_agg = current.get("aggregate", {})
-    for metric, higher_is_better in GATED_METRICS.items():
+    for metric, higher_is_better in gated_set.items():
         if metric not in base_agg or metric not in cur_agg:
             continue
         base_value = float(base_agg[metric])
@@ -857,7 +1112,7 @@ def compare_reports(current: dict, baseline: dict, tolerance: float = 0.0,
         if verdict == "REGRESSION":
             regressions.append(f"{metric}: {base_value} -> {cur_value}")
 
-    for metric in INFORMATIONAL_METRICS:
+    for metric in informational_set:
         if metric in base_agg and metric in cur_agg:
             rows.append({
                 "metric": f"{metric} (informational)",
@@ -869,7 +1124,7 @@ def compare_reports(current: dict, baseline: dict, tolerance: float = 0.0,
     base_mod = baseline.get("per_modality", {})
     cur_mod = current.get("per_modality", {})
     for modality in sorted(set(base_mod) & set(cur_mod)):
-        for metric, higher_is_better in PER_MODALITY_GATED.items():
+        for metric, higher_is_better in modality_set.items():
             if metric not in base_mod[modality] or metric not in cur_mod[modality]:
                 continue
             base_value = float(base_mod[modality][metric])
@@ -893,7 +1148,7 @@ def compare_reports(current: dict, baseline: dict, tolerance: float = 0.0,
         if before is None:
             per_query_regressions.append(f"{record['id']}: new query, no baseline")
             continue
-        for metric in PER_QUERY_GATED:
+        for metric in per_query_set:
             delta = float(record.get(metric, 0.0)) - float(before.get(metric, 0.0))
             if delta < -tolerance - 1e-9:
                 per_query_regressions.append(
@@ -903,7 +1158,16 @@ def compare_reports(current: dict, baseline: dict, tolerance: float = 0.0,
             per_query_regressions.append(
                 f"{record['id']} leaked {record['forbidden_hits']} (baseline was clean)"
             )
-        if before.get("abstention_correct") and not record.get("abstention_correct"):
+        if restricted:
+            # Abstention accuracy is not comparable across modes: one run measures
+            # the final decision, the other only the pre-generation one. What is
+            # comparable is a decision that used to be right and is now wrong.
+            if before.get("abstention_correct") and record.get("preflight_correct") is False:
+                per_query_regressions.append(
+                    f"{record['id']} pre-generation decision broke "
+                    f"(baseline abstained correctly; this run did not refuse)"
+                )
+        elif before.get("abstention_correct") and not record.get("abstention_correct"):
             per_query_regressions.append(f"{record['id']} abstention behaviour broke")
 
     gated_failures = len(regressions)
@@ -913,14 +1177,22 @@ def compare_reports(current: dict, baseline: dict, tolerance: float = 0.0,
         ])
 
     missing = [qid for qid in base_by_id if qid not in {r["id"] for r in current["per_query"]}]
+    scope = (
+        "retrieval metrics only -- this run generated no answers, so answer "
+        "quality was not gated"
+        if restricted else "all gated metrics"
+    )
     headline = (
         f"Baseline `{baseline.get('timestamp', '?')}` (dataset v"
         f"{baseline.get('dataset_version')}, commit {baseline.get('git_commit')}) "
-        f"vs this run. Tolerance {tolerance}. "
+        f"vs this run. Tolerance {tolerance}. Scope: {scope}. "
         + (f"FAIL: {gated_failures} gated regression(s)." if gated_failures
            else "PASS: no gated metric regressed.")
     )
     return {
+        "mode": mode,
+        "baseline_mode": base_mode,
+        "scope": scope,
         "baseline_timestamp": baseline.get("timestamp"),
         "baseline_git_commit": baseline.get("git_commit"),
         "baseline_dataset_version": baseline.get("dataset_version"),
@@ -939,7 +1211,13 @@ def compare_reports(current: dict, baseline: dict, tolerance: float = 0.0,
 def write_reports(report: dict) -> dict[str, Path]:
     reports_dir = settings.evaluation_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
+    retrieval_only = report.get("mode") == "retrieval-only"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if retrieval_only:
+        # Named differently on purpose: two reports in one directory, one of which
+        # measured answers and one of which did not, should not be interchangeable
+        # by filename alone.
+        stamp += "_retrieval"
 
     json_path = reports_dir / f"report_{stamp}.json"
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -947,7 +1225,8 @@ def write_reports(report: dict) -> dict[str, Path]:
     csv_path = reports_dir / f"report_{stamp}.csv"
     fields = [
         "id", "expected_modality", "tags", "abstained", "expect_abstention",
-        "abstention_correct", "precision", "recall", "mrr", "citation_accuracy",
+        "abstention_correct", "status", "preflight_decision", "preflight_correct",
+        "decision", "precision", "recall", "mrr", "citation_accuracy",
         "answer_correctness", "groundedness", "hallucinated_numbers",
         "unverified_numbers", "forbidden_hits", "latency_s",
         "judge_consistency", "judge_grounded", "judge_answers_question",
@@ -967,11 +1246,14 @@ def write_reports(report: dict) -> dict[str, Path]:
 
     md_path = reports_dir / f"report_{stamp}.md"
     aggregate = report["aggregate"]
+    latency = report.get("latency") or {}
     lines = [
         "# Evidence AI Evaluation Report", "",
         f"- Dataset version: **{report['dataset_version']}**",
+        f"- Mode: **{report.get('mode', 'full')}**",
         f"- Timestamp (UTC): {report['timestamp']}",
         f"- Git commit: `{report['git_commit']}`", "",
+        f"> {report.get('scope_note', '')}", "",
         "## Models", "",
         *[f"- {k}: `{v}`" for k, v in report["models"].items()], "",
         "## Configuration", "",
@@ -979,18 +1261,48 @@ def write_reports(report: dict) -> dict[str, Path]:
         "## Aggregate metrics", "",
         "| Metric | Value |", "| --- | --- |",
         *[f"| {k.replace('_', ' ').title()} | {v} |" for k, v in aggregate.items()], "",
+    ]
+    if latency.get("n"):
+        lines += [
+            "## Latency", "",
+            "Per-query wall time as the harness measured it, including model load on "
+            "the first query of the run.", "",
+            "| n | mean | min | p50 | p95 | max |", "| --- | --- | --- | --- | --- | --- |",
+            f"| {latency['n']} | {latency['mean_s']} s | {latency['min_s']} s | "
+            f"{latency['p50_s']} s | {latency['p95_s']} s | {latency['max_s']} s |", "",
+            f"_{latency.get('method', '')}"
+            + (f". {latency['note']}_" if latency.get("note") else "_"), "",
+            "Informational, never gated: latency measures the host, and failing a "
+            "correct change because it ran on a slower laptop teaches people to "
+            "ignore the gate.", "",
+        ]
+    lines += [
         "## Per-modality", "",
         "An aggregate over a mixed set can hide one modality collapsing.", "",
-        "| Expected modality | Qs | Correct | Cite | Recall | Ground | Abstain | Leaks | Pass |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-    for modality, block in report.get("per_modality", {}).items():
-        lines.append(
-            f"| {modality} | {block['queries']} | {block['answer_correctness']} | "
-            f"{block['citation_accuracy']} | {block['retrieval_recall']} | "
-            f"{block['groundedness']} | {block['abstention_accuracy']} | "
-            f"{block['forbidden_leak_rate']} | {block['pass_rate']} |"
-        )
+    if retrieval_only:
+        lines += [
+            "| Expected modality | Qs | Recall | Precision | MRR | Preflight right | Undecided |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for modality, block in report.get("per_modality", {}).items():
+            lines.append(
+                f"| {modality} | {block['queries']} | {block.get('retrieval_recall')} | "
+                f"{block.get('retrieval_precision')} | {block.get('mrr')} | "
+                f"{block.get('preflight_accuracy')} | {block.get('undecided')} |"
+            )
+    else:
+        lines += [
+            "| Expected modality | Qs | Correct | Cite | Recall | Ground | Abstain | Leaks | Pass |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for modality, block in report.get("per_modality", {}).items():
+            lines.append(
+                f"| {modality} | {block['queries']} | {block.get('answer_correctness', '-')} | "
+                f"{block.get('citation_accuracy', '-')} | {block.get('retrieval_recall', '-')} | "
+                f"{block.get('groundedness', '-')} | {block.get('abstention_accuracy', '-')} | "
+                f"{block.get('forbidden_leak_rate', '-')} | {block.get('pass_rate', '-')} |"
+            )
     coverage = report.get("dataset_coverage", {})
     if coverage:
         lines += [
@@ -998,22 +1310,51 @@ def write_reports(report: dict) -> dict[str, Path]:
             *[f"- {k.replace('_', ' ').title()}: {v}" for k, v in coverage.items()],
             "",
         ]
-    lines += [
-        "## Per-query results", "",
-        "| ID | Mod | Tags | Abstain (exp) | P | R | MRR | Cite | Correct | Ground | Guard | Leaks | s |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for record in report["per_query"]:
-        lines.append(
-            f"| {record['id']} | {record['expected_modality']} | "
-            f"{', '.join(record['tags']) or '-'} | {record['abstained']} "
-            f"({record['expect_abstention']}) | {record['precision']} | "
-            f"{record['recall']} | {record['mrr']} | {record['citation_accuracy']} | "
-            f"{record['answer_correctness']} | {record['groundedness']} | "
-            f"{', '.join(record['unverified_numbers']) or '-'} | "
-            f"{', '.join(record['forbidden_hits']) or '-'} | "
-            f"{record['latency_s']} |"
-        )
+    if retrieval_only:
+        lines += [
+            "## Per-query results", "",
+            "| ID | Mod | Tags | Status | Decision (expected) | P | R | MRR | Decisive check | s |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for record in report["per_query"]:
+            lines.append(
+                f"| {record['id']} | {record['expected_modality']} | "
+                f"{', '.join(record['tags']) or '-'} | {record['status']} | "
+                f"{record['preflight_decision']} ({record['expect_abstention']}) | "
+                f"{record['precision']} | {record['recall']} | {record['mrr']} | "
+                f"{record.get('decision') or '-'} | {record['latency_s']} |"
+            )
+        if report.get("skipped_metrics"):
+            lines += [
+                "", "## Not measured in this mode", "",
+                "Absent from the aggregate above, and absent rather than zero:", "",
+                *[f"- `{name}`" for name in report["skipped_metrics"]], "",
+                "Run without `--retrieval-only` to measure them. A retrieval-only "
+                "run cannot be promoted to a baseline.", "",
+            ]
+        if report.get("undecided_queries"):
+            lines += [
+                "Undecided here (the dataset expects a refusal that may legitimately "
+                "come from the model rather than a guard): "
+                + ", ".join(f"`{qid}`" for qid in report["undecided_queries"]), "",
+            ]
+    else:
+        lines += [
+            "## Per-query results", "",
+            "| ID | Mod | Tags | Abstain (exp) | P | R | MRR | Cite | Correct | Ground | Guard | Leaks | s |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for record in report["per_query"]:
+            lines.append(
+                f"| {record['id']} | {record['expected_modality']} | "
+                f"{', '.join(record['tags']) or '-'} | {record['abstained']} "
+                f"({record['expect_abstention']}) | {record['precision']} | "
+                f"{record['recall']} | {record['mrr']} | {record.get('citation_accuracy')} | "
+                f"{record.get('answer_correctness')} | {record.get('groundedness')} | "
+                f"{', '.join(record.get('unverified_numbers') or []) or '-'} | "
+                f"{', '.join(record.get('forbidden_hits') or []) or '-'} | "
+                f"{record['latency_s']} |"
+            )
     notes = [(r["id"], r["notes"]) for r in report["per_query"] if r.get("notes")]
     if notes:
         lines += ["", "## Ground truth notes", ""]
@@ -1083,12 +1424,43 @@ def main() -> int:
              "version. The numbers will not mean the same thing.",
     )
     parser.add_argument(
+        "--retrieval-only", action="store_true",
+        help="Score retrieval, reranking and the pre-generation guards only. No "
+             "generation, so no Ollama and no GPU: the whole set runs in seconds "
+             "instead of minutes, which is what makes it usable as a per-commit "
+             "gate. Answer metrics are reported as absent, never as zero, and a "
+             "retrieval-only run cannot be promoted to a baseline.",
+    )
+    parser.add_argument(
         "--save-baseline", action="store_true",
         help=f"Promote this run to {BASELINE_PATH.name} for future --compare runs.",
     )
     args = parser.parse_args()
 
-    report = run_evaluation(judge=args.judge)
+    if args.retrieval_only and args.judge:
+        print("REFUSING: --judge scores answers, and --retrieval-only generates none.")
+        return 2
+    if args.retrieval_only and args.save_baseline:
+        print("REFUSING: --save-baseline with --retrieval-only would replace the")
+        print("baseline with a report that has no answer metrics. Every later full")
+        print("run would then be compared against numbers that were never measured.")
+        print("Re-run without --retrieval-only to promote a baseline.")
+        return 2
+
+    report = run_evaluation(judge=args.judge, retrieval_only=args.retrieval_only)
+
+    check_queries = report.get("check_queries") or []
+    if args.retrieval_only:
+        statuses = [r["status"] for r in report["per_query"]]
+        undecided = report.get("undecided_queries") or []
+        print("\n" + "=" * 78)
+        print(f"RETRIEVAL GATE  {statuses.count('PASS')} PASS / "
+              f"{statuses.count('CHECK')} CHECK / {statuses.count('UNDECIDED')} UNDECIDED")
+        if undecided:
+            print("  undecided -- the dataset expects a refusal that may come from the "
+                  "model,\n  which this mode does not run: " + ", ".join(undecided))
+        if check_queries:
+            print("  CHECK: " + ", ".join(check_queries))
 
     exit_code = 0
     if args.compare:
@@ -1138,6 +1510,12 @@ def main() -> int:
                   + ", ".join(comparison["queries_missing_from_this_run"]))
         print(f"\n  {comparison['headline']}")
         exit_code = 0 if comparison["passed"] else 1
+    elif args.retrieval_only and check_queries:
+        # Without a baseline to compare against, the fast gate still has to be able
+        # to fail: a query whose evidence was not found, or whose pre-generation
+        # decision contradicts the dataset, is a regression against the dataset
+        # itself. UNDECIDED rows are out of scope for this mode and never fail it.
+        exit_code = 1
 
     paths = write_reports(report)
 
@@ -1150,13 +1528,29 @@ def main() -> int:
     print("AGGREGATE")
     for key, value in report["aggregate"].items():
         print(f"  {key:24s} {value}")
+    latency = report.get("latency") or {}
+    if latency.get("n"):
+        print("\nLATENCY")
+        print(f"  n={latency['n']} mean={latency['mean_s']}s p50={latency['p50_s']}s "
+              f"p95={latency['p95_s']}s min={latency['min_s']}s max={latency['max_s']}s")
+        if latency.get("note"):
+            print(f"  ({latency['note']})")
     if report.get("per_modality"):
         print("\nPER-MODALITY")
         for modality, block in report["per_modality"].items():
-            print(f"  {modality:8s} n={block['queries']:<3d} "
-                  f"correct={block['answer_correctness']:<7} "
-                  f"cite={block['citation_accuracy']:<7} "
-                  f"pass={block['pass_rate']}")
+            if report.get("mode") == "retrieval-only":
+                print(f"  {modality:8s} n={block['queries']:<3d} "
+                      f"recall={block.get('retrieval_recall'):<7} "
+                      f"mrr={block.get('mrr'):<7} "
+                      f"preflight={block.get('preflight_accuracy')}")
+            else:
+                print(f"  {modality:8s} n={block['queries']:<3d} "
+                      f"correct={block.get('answer_correctness', '-'):<7} "
+                      f"cite={block.get('citation_accuracy', '-'):<7} "
+                      f"pass={block.get('pass_rate', '-')}")
+    if report.get("mode") == "retrieval-only":
+        print("\nNOT MEASURED IN THIS MODE (absent above, not zero): "
+              + ", ".join(report.get("skipped_metrics") or []))
     print("\nReports written:")
     for label, path in paths.items():
         print(f"  {label:9s} {path}")

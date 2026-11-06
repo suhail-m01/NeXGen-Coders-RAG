@@ -174,6 +174,19 @@ python scripts/manifest.py --json              # the build you are about to ship
 - `auth/users.db`, `history/chat_history.db` and `index/` are **unencrypted**.
   Anyone with the files has the corpus and the session history. Use OS or disk
   encryption if the material is sensitive, and never commit them.
+- Chat history is an API resource, so decide who should reach it before you deploy:
+  reading and deleting a session needs only the `ask` permission (every role), while
+  exporting one needs `export_history` (admin). Sessions carry no owner column, so
+  "your own session" means "any session" — a viewer can delete a session an admin
+  created. If that is not acceptable for your material, do not expose the port.
+- The routes that run models are rate limited: 30 questions/minute with a burst of 6
+  and 60 ingestions/minute with a burst of 20, one token charged per uploaded file.
+  A refusal is `429` with a `Retry-After` header and happens before any model loads.
+  The counters live in process memory, so **two workers means twice the limit**; put
+  the limiter behind your proxy's own limiting if you scale out, or run one worker.
+  Only set `RATE_LIMIT_TRUST_FORWARDED_FOR=true` behind a proxy you control — it makes
+  the rightmost `X-Forwarded-For` hop the client, and any client can write the rest of
+  that header.
 - The React UI stores its bearer token in `localStorage` and calls `POST /logout`
   on sign-out, which revokes the token server-side rather than only forgetting it.
   That is normal for a browser app and worth knowing: on a shared machine, sign

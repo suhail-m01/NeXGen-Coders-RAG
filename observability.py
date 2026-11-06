@@ -254,6 +254,16 @@ def build_manifest(index_stats: dict | None = None) -> dict:
     except Exception:
         dataset_version = None
 
+    # The accepted formats are read from the router's own tables rather than
+    # restated here. The manifest is what the browser UI shows for "which files can
+    # I drop in", and a copy of the list would drift the first time the router
+    # learned a new format -- a drop zone that accepts what the server refuses
+    # wastes the user's time twice.
+    try:
+        from rag_pipeline import AUDIO_EXTENSIONS, DOCUMENT_EXTENSIONS, IMAGE_EXTENSIONS
+    except Exception:  # pragma: no cover -- the router is always importable
+        AUDIO_EXTENSIONS = DOCUMENT_EXTENSIONS = IMAGE_EXTENSIONS = set()
+
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "application": {
@@ -297,6 +307,15 @@ def build_manifest(index_stats: dict | None = None) -> dict:
             "structure_min_chunk_chars": settings.structure_min_chunk_chars,
             "parent_expansion_enabled": settings.parent_expansion_enabled,
             "parent_max_chars": settings.parent_max_chars,
+        },
+        "ingestion": {
+            "documents": sorted(DOCUMENT_EXTENSIONS),
+            "images": sorted(IMAGE_EXTENSIONS),
+            "audio": sorted(AUDIO_EXTENSIONS),
+            "formats": len(DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS | AUDIO_EXTENSIONS),
+            "max_file_bytes": settings.max_file_bytes,
+            "pdf_tables": settings.pdf_table_extraction_enabled,
+            "contextual_retrieval": settings.contextual_retrieval_enabled,
         },
         "guards": {
             "abstention_threshold": settings.abstention_threshold,

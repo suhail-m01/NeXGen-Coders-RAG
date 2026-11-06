@@ -44,6 +44,7 @@ application needs no internet at all.
 | Capability | How |
 | --- | --- |
 | Multimodal ingestion | PDF, DOC, DOCX, TXT, CSV, PNG/JPG/WEBP, WAV/MP3/M4A |
+| PDF tables | detected per page and indexed as markdown grids, so a row's cells stay in one item — measured on this corpus: retrieval precision .3115 → .3531 |
 | Local OCR | Tesseract 5 |
 | Local image understanding | Qwen2.5-VL:3B through Ollama — real image input |
 | Local speech-to-text | faster-whisper, timestamped segments |
@@ -58,14 +59,17 @@ application needs no internet at all.
 | Evidence guards | coverage, entity, temporal, period, numeric and repetition checks — each can refuse, annotate or reorder |
 | Answer completion | a figure stated elsewhere in the retrieved evidence is appended and labelled, never invented |
 | Speaker diarization | spectral clustering over the transcript, so audio evidence can carry more than one voice |
-| Chat history | per-session records with the full pipeline trace, replayable and exportable |
-| Collections | logical groupings; a query can be scoped to one |
+| Chat history | per-session records with the full pipeline trace, replayable and exportable — over HTTP as well as in the operator UI |
+| Rate limiting | token bucket on the routes that run models, per account, with `429` + `Retry-After` before any model loads |
+| Collections | logical groupings a question can be scoped to, managed through the API and both UIs — deleting one regroups its sources and never deletes them |
+| Contextual retrieval | optional per-chunk situating blurb, prepended to the text that is embedded rather than to the chunk itself — measured, off by default |
 | Accounts and roles | local users, three roles with distinct permissions, lockout, API bearer tokens |
 | Reproducible evaluation | fixed 16-query dataset, versioned reports, regression gate against a baseline |
 | Observability | per-query stage trace and a run manifest naming the exact build |
-| React UI | built to static files and served by the API at `/ui` |
+| React UI | built to static files and served by the API at `/ui`: streaming answers, an overview landing view, interactive citations, evidence scores, stage trace, chat history, a collections manager, drag-and-drop ingestion with a per-file queue, and keyboard shortcuts |
 | Offline runtime | verified with an outbound-socket guard |
-| Offline self-test | 86 checks over the guards, store and trace — no LLM, no network |
+| Offline self-test | 258 checks over the guards, store, collections, PDF tables, contextual retrieval, trace, configuration surface, the experiment harness's verdict rule and the kit verifier's judgement — no LLM, no network |
+| Verifiable distribution | every archive carries `KIT_MANIFEST.json` with a sha256 for each entry, and `scripts/verify_kit.py` checks it with the standard library alone — a download can be proved complete before anything is installed |
 
 ---
 
@@ -306,8 +310,8 @@ Ingest everything under `data/`:
 .venv\Scripts\python.exe scripts\ingest_demo.py
 ```
 
-Or use the **Sources** panel in the React UI, the **Ingest** tab in Streamlit, or
-`POST /ingest`. Re-ingesting a file that changed replaces the old version when
+Or drop files on the **Sources** panel in the React UI — one queue row per file, each
+with its own outcome — the **Ingest** tab in Streamlit, or `POST /ingest`. Re-ingesting a file that changed replaces the old version when
 `replace=true` is passed; without it both versions stay searchable, and
 `GET /sources/stale` (and the React Sources panel) says which files are in that
 state. `scripts\reindex.py` rebuilds the whole index from `data/` in one pass.
@@ -336,6 +340,71 @@ reindex — `scripts\reindex.py`.
 
 **`source_id` is a content hash.** Re-ingesting the same bytes produces the same
 IDs and adds no duplicate vectors, which is what makes evaluation reproducible.
+
+---
+
+### Collections
+
+A collection is a label on an indexed source, and a question can be scoped to one —
+in the React UI's scope dropdown, the Streamlit sidebar, `POST /query`'s
+`collection` field, or `--collection` on the CLI. Ingesting without naming one
+files the source under `general`.
+
+Two properties are worth stating plainly, because the obvious reading of the words
+is wrong:
+
+- **Deleting a collection deletes nothing.** Its sources move to `general`, keep
+  their items, vectors and relationships, and stay citable. A question scoped to
+  the deleted name simply stops matching. `general` itself cannot be renamed or
+  deleted, because that is where ingestion defaults and where a deleted
+  collection's sources go.
+- **Regrouping never re-embeds.** A collection is one column of the `sources`
+  table, so creating, renaming, deleting and moving sources between them costs
+  milliseconds and cannot damage the index.
+
+Names are normalized (whitespace collapsed, capped at 60 characters) and compared
+case-insensitively, so `Board` cannot sit beside `board` in one dropdown; path
+separators and control characters are refused, because the name ends up in a URL
+path and in every line of output that prints it. A collection can be declared
+before anything is filed under it — an empty group is a real thing to have, and
+deriving the list from sources alone would make it disappear between creating it
+and filling it.
+
+Managing collections needs the `manage_collections` permission (admin). Every
+signed-in role may read the list and scope a question to one.
+
+### Reading the chunks
+
+Every chunking argument in this project was settled by looking at the chunks
+rather than at a score. `scripts\dump_chunks.py` does that, and it has two modes
+because they answer different questions:
+
+```powershell
+# What would this file become? Extraction and chunking run for real; nothing is
+# embedded, written or indexed.
+.venv\Scripts\python.exe scripts\dump_chunks.py --file data\documents\project_report.pdf
+
+# Compare the two chunking modes on one document, without rebuilding the index
+# or editing .env -- the override lives in that process only.
+.venv\Scripts\python.exe scripts\dump_chunks.py --file slides.pptx --chunking-mode structure --stats
+
+# What is actually citable right now? Reads the stored items, not a fresh run.
+.venv\Scripts\python.exe scripts\dump_chunks.py --source project_report.pdf --grep "87 percent"
+.venv\Scripts\python.exe scripts\dump_chunks.py --all --stats
+```
+
+Each row is `n | item_id | modality | location | size | flags` with a preview
+under it (`--chars 0` or `--full` for the whole text, `--json` for a machine-readable
+dump, which goes to stdout alone so it can be redirected). The flags column carries
+the metadata that explains a strange-looking chunk: `ocr-unreliable`, `ocr 41%`,
+`no-vision`, `heading-only`, `parent`, `merged 3`, `table`, `speaker 1`. Locations
+are rendered only from what the processor recorded — an audio segment shows a clock
+range and never a page number, because inventing one is the failure mode this whole
+project is built against.
+
+What it will not tell you: a chunk that reads well here can still lose in retrieval
+to a near-duplicate of itself. This shows the evidence as stored, not the ranking.
+`evaluation.py --retrieval-only` is the tool for that question.
 
 ---
 
@@ -492,12 +561,25 @@ working shows up as a regression rather than as a quieter answer.
 | `GET /manifest` | the exact build behind a result | `ask` |
 | `POST /ingest` | upload and index files (`replace=true` retires older versions) | `ingest` |
 | `POST /query` | text query; response carries the stage trace | `ask` |
+| `POST /query_stream` | the same answer as newline-delimited JSON as it is generated: `{"type":"token"}` lines, then one `{"type":"result"}` line carrying the `/query` body unchanged. A refusal streams no tokens at all, because abstention happens before generation | `ask` |
+| `GET /models` | the configured model, whether it is actually installed on the inference server, and what is installed instead. Read-only: nothing here can change the build a result is attributed to | `ask` |
 | `POST /query_file` | image / audio / document query | `ask` |
 | `GET /sources` | list indexed sources and collections | `ask` |
 | `GET /sources/stale` | filenames with more than one indexed version | `ask` |
 | `GET /source/{id}` | source detail and its items | `ask` |
 | `GET /source/{id}/file` | original file (constrained to `data/`) | `ask` |
 | `DELETE /source/{id}` | remove a source and rebuild the vector index | `delete` |
+| `GET /history/sessions` | recent sessions with message counts | `ask` |
+| `POST /history/sessions` | start an empty session | `ask` |
+| `GET /history/sessions/{id}` | every message with its stored trace and citations | `ask` |
+| `PATCH /history/sessions/{id}` | rename a session | `ask` |
+| `DELETE /history/sessions/{id}` | delete a session's messages (sources untouched) | `ask` |
+| `GET /history/sessions/{id}/export?format=markdown\|csv` | a whole conversation for a reviewer | `export_history` |
+| `GET /collections` | every collection with source and item counts | `ask` |
+| `POST /collections` | declare a collection (409 on a case-insensitive clash) | `manage_collections` |
+| `PATCH /collections/{name}` | rename it, moving its sources | `manage_collections` |
+| `DELETE /collections/{name}` | ungroup it — sources move to `general` | `manage_collections` |
+| `POST /collections/{name}/sources` | file existing sources under it, in one call | `manage_collections` |
 
 Interactive docs at `http://127.0.0.1:8000/docs`.
 
@@ -518,6 +600,24 @@ browser. Only the token's digest is stored; five failed password attempts lock a
 account for five minutes, and a locked account is told so (HTTP 423) rather than
 being invited to try again. Set `API_AUTH_ENABLED=false` for a single-user
 machine and every endpoint answers anonymously.
+
+**Rate limiting.** `/query`, `/query_file` and `/ingest` run local models, so
+they sit behind a token bucket: 30 questions per minute with a burst of 6, 60
+ingestions per minute with a burst of 20, and one token charged per uploaded
+file. Past that a request is refused with `429` and a `Retry-After` header
+*before* any model is loaded, which is the point — a request that would take
+eleven seconds of GPU time is cheap to refuse and expensive to queue. Read-only
+endpoints are never limited. The count lives in process memory, so two uvicorn
+workers mean twice the effective limit; that is stated in `/health` rather than
+hidden. Bulked-up ingestion belongs in `scripts\reindex.py`, which reads from
+disk and never touches HTTP.
+
+**Recording a conversation.** `POST /query` and `POST /query_file` take an
+optional `session_id`. Pass one and the turn is written to chat history with its
+trace, citations and unverified figures — the same call the Streamlit UI makes,
+so an answer recorded in the browser replays in the operator UI and one recorded
+there replays over HTTP. Pass nothing and the question is answered and not
+stored, which is what a probe or a monitor should do.
 
 ```powershell
 # Use curl.exe, not curl: in PowerShell `curl` is an alias for
@@ -587,6 +687,7 @@ sources, expected answers, `must_not_contain` strings and tags.
 ```powershell
 .venv\Scripts\python.exe evaluation.py                # run and report
 .venv\Scripts\python.exe evaluation.py --compare      # gate against baseline.json
+.venv\Scripts\python.exe evaluation.py --retrieval-only --compare   # fast gate, no LLM
 ```
 
 `--compare` is the regression gate: it diffs every gated metric against
@@ -615,12 +716,50 @@ build that produced it.
 | Numeric-guard rate | — | 0.0000 |
 | Forbidden-leak rate | 0.1875 | **0.0000** |
 | Mean latency | 6.58 s | 11.01 s |
+| Median latency (p50) | not reported then | 10.77 s |
+| p95 = slowest query | not reported then | 29.53 s |
+
+The percentiles come from `report_20261105_210544` — the first run after they
+were added, same gate result (**16 PASS / 0 CHECK**, exit 0) — because the
+`_200057` report predates the field. The mean was the misleading number: 11.0 s
+average with a 29.5 s maximum, the first query of the run loading three models.
+Percentiles are nearest-rank order statistics over the 16 queries, so with a
+sample this size p95 *is* the slowest query, which every report now says out
+loud rather than leaving "p95" to imply a distribution nobody sampled.
 
 Latency roughly doubled because the guards and the completion pass added work and
 the output cap lengthened some generations; every gated quality metric moved up or
 held. One per-query change is reported rather than gated: Q16's citation accuracy
 went 1.0 → 0.8, because the answer now quotes two sources where the dataset
 expects one.
+
+**Fast gate.** `--retrieval-only` runs the same 16 queries through
+representation, retrieval, reranking and the pre-generation guards, then stops:
+no LLM, no GPU, **33 s** against 193 s for the full run, and no Ollama at all —
+verified by pointing `OLLAMA_HOST` at a dead port and watching it finish.
+Measured on `report_20261105_210146_retrieval`: **15 PASS / 0 CHECK / 1
+UNDECIDED**, precision 0.3115, recall 0.9635, MRR 0.6458 — the same retrieval
+numbers the full run produces, because it runs the real code path up to the point
+where generation would start rather than a parallel reimplementation of it. A
+second retrieval path would drift, and a gate that measures something other than
+what ships is worse than no gate.
+
+The one UNDECIDED row is `Q9-adversarial-year`, and the reason is worth stating
+precisely: the check that refuses it is the **temporal guard**, which compares
+the *answer's* period against the question's and so runs after generation
+(`rag_pipeline.py`, step 7a). A mode that never generates cannot know what it
+would have decided, so it reports that instead of guessing. The other two
+adversarial refusals — the coverage guard on a 2040 question, the entity guard on
+Project Beta — do fire before generation and are gated here, along with the
+retrieval quality of every query.
+
+Honesty rails, all of them enforced in code: a retrieval-only report **cannot**
+be promoted to a baseline (`--save-baseline` is refused with an explanation),
+`--compare` narrows itself to precision, recall and MRR and prints that narrowed
+scope in its headline, unmeasured metrics are **absent** from the aggregate
+rather than reported as 0.0, and the files are named
+`report_<timestamp>_retrieval.*` so the two kinds of report are not
+interchangeable in one directory.
 
 > **Reading precision honestly.** Precision looks low because the metric counts
 > any retrieved file not in `expected_sources` as a miss — but the demo corpus is
@@ -666,7 +805,10 @@ history.
 **The run manifest** — `GET /manifest`, `scripts\manifest.py`, the Streamlit
 sidebar and every evaluation report all carry the same document: git commit and
 whether the tree is dirty, platform, the four model names, every retrieval,
-chunking, guard, generation and auth setting, index counts and dataset version.
+chunking, guard, generation and auth setting, the ingestion surface (the formats
+the router accepts, the upload cap, whether PDF tables are lifted out), index
+counts and dataset version. The browser's drop zone reads that ingestion block
+rather than carrying its own list of formats, so the two cannot drift.
 A screenshot of an answer is only reproducible if the build behind it is recorded
 too.
 
@@ -732,20 +874,53 @@ The index reloads from disk. `test_index_survives_restart` and
 ## Verification
 
 There is no pytest suite in this repository, and nothing here claims otherwise.
-Verification is five commands, run in this order, each with a real exit code:
+Verification is seven commands, run in this order, each with a real exit code:
 
 | Command | Proves | Needs | Last run |
 | --- | --- | --- | --- |
-| `python scripts\selftest.py` | **86/86 checks**: constraint guards (entity, temporal, period targeting, ordinal-quarter pairing, and that reordering does not rescore), evidence completion, repetition collapse, numeric-guard locator exclusions, parent building and expansion, stage trace, manifest, and the `parents` table round-trip including delete cascade | nothing — no LLM, no network, throwaway index | exit 0 |
-| `python scripts\apitest.py` | **30 checks** over the browser-facing API, through a test client so no port is bound: the static bundle and its relative asset paths under `/ui`, `POST /login`, `GET /me`, `POST /logout`, viewer-versus-admin permissions (403 not 401), stale versions, manifest, first-run bootstrap and the lockout ladder. `--with-query` adds the live `/query` contract (**32/32** measured) | nothing for the 30; Ollama for `--with-query` | exit 0 |
+| `python scripts\selftest.py` | **258/258 checks**: constraint guards (entity, temporal, period targeting, ordinal-quarter pairing, and that reordering does not rescore), evidence completion, repetition collapse, numeric-guard locator exclusions, parent building and expansion, stage trace, manifest, the `parents` table round-trip including delete cascade, the rate limiter's bucket arithmetic and client keying, that every setting is documented in `.env.example`, the chunk inspector's location, flag and size rendering, the collections store (name normalization, the five refused name shapes, moving, renaming, and that deleting a collection deletes nothing), that the manifest's format tables are exactly the router's, and PDF table extraction (the grid and its caption parsing, the claim-and-release bookkeeping that decides which words belong to a cell, that a region too small to be a table is handed back to the prose, and that no word on a page is withheld from the index), and contextual retrieval (prompt building, document truncation, the six replies that are not blurbs, that annotating never rewrites a chunk, that a model which is down costs a warning and not an ingest, that the embedding and the lexical leg both see the blurb, and that a blurb survives reopening the index), and the kit verifier (the assets a built page asks the browser for, the entries that must never travel in an archive, the three distinct ways an archive and its manifest can disagree, zip-slip refusal, wrapper-folder handling, and that every file the verifier demands is also build-blocking) | nothing — no LLM, no network, throwaway index; the shipped demo corpus for the table checks | exit 0 |
+| `python scripts\apitest.py` | **78 checks** over the browser-facing API, through a test client so no port is bound: the static bundle and its relative asset paths under `/ui`, `POST /login`, `GET /me`, `POST /logout`, viewer-versus-admin permissions (403 not 401), chat history including who may export it, the `429` path of the rate limiter, stale versions, manifest including the accepted ingestion formats, the five collection routes, first-run bootstrap and the lockout ladder. The last three checks assert that the account database, the history database **and the corpus index** hold exactly what they held at the start — the suite moves a real source into a temporary collection and back again, so that invariant is asserted rather than assumed, and it is checked by opening the index read-only so the check cannot damage what it verifies. `--with-query` adds the live `/query` contract and a recorded turn read back from history (**88/88** measured) | nothing for the 74; Ollama for `--with-query` | exit 0 |
 | `python scripts\verify_env.py` | every import resolves and each external binary is reachable, including a real audio decode | installed dependencies | exit 0 |
 | `python scripts\smoke_test.py` | **4/4** end-to-end questions answered with citations, plus a genuine abstention | Ollama + cached models | exit 0 |
 | `python scripts\verify_offline.py` | blocks every non-loopback socket for the whole run, then loads the models and answers — proving the offline claim rather than asserting it | cached models | exit 0 |
-| `python evaluation.py --compare` | **16/16 PASS**, no gated metric below `baseline.json`, per modality and per query | Ollama + built index | exit 0 |
+| `python evaluation.py --retrieval-only --compare` | the fast gate: retrieval, reranking and the pre-generation guards over all 16 queries, with retrieval metrics diffed against the baseline. **15 PASS / 0 CHECK / 1 UNDECIDED** in 33 s | built index — no Ollama, no GPU | exit 0 |
+| `python evaluation.py --compare` | **16/16 PASS**, no gated metric below `baseline.json`, per modality and per query. Latest: retrieval precision **0.3531**, recall 0.9635, MRR 0.6458, citation accuracy **0.5635**, correctness 1.0, abstention 1.0, forbidden leak 0.0, no per-query regression to report (report `report_20261106_000901`, taken at commit `1fac077` with a clean tree. The shipped configuration has now been measured five times — `report_20261105_215324`, `report_20261105_224257`, `report_20261105_234615`, `report_20261106_000324`, `report_20261106_000901` — and every gated metric came back identical each time) | Ollama + built index | exit 0 |
+
+Front-end changes have one more check, and it needs Node rather than Python:
+
+```powershell
+cd webui && npm install && npm run test:render
+```
+
+`webui/ssr_smoke.jsx` renders all twenty panels with `react-dom/server`, so an
+undefined variable, a missing export or a broken JSX tree fails in half a second
+instead of appearing in a browser as a blank white page. Most cases also assert that
+a given string reached the screen — the six queue statuses, the accepted formats,
+the rate-limit note — because rendering is not the only way a component fails:
+it can render an empty list just as happily. Effects do not run during
+a server render, so this covers the render path; `scripts\apitest.py` covers the
+API calls behind it. Node is **not** needed to run the shipped application — the
+prebuilt bundle in `webui/dist` is committed and served by the API.
+
+`--retrieval-only` is the one to run on every change: it is the only gate cheap
+enough to run before each commit rather than only before a release, and it needs
+no LLM. It does not replace the full run, which is the only thing that measures
+answers.
 
 `selftest.py` is the one to run before a demo: it needs no model, no index and no
 network, so it works on a laptop that has not finished downloading anything yet,
 and it exits non-zero if a guard has stopped behaving.
+
+`verify_kit.py` is the one to run before even that, and before installing anything:
+it is standard library only and imports nothing from this project, so it works on a
+machine that has Python and nothing else. It proves an archive is the archive
+`build_kit.py` wrote — every hash, every required file, no secret or generated
+database along for the ride, every asset the built UI asks the browser for actually
+inside the zip, and every report these documents quote by name present to be opened.
+A download that was truncated then fails in ten seconds with a list of what is
+missing, instead of failing three steps later in a way that looks like a bug here.
+`RECOVERY.md` is what to read if the tree itself is lost: it names the two artefacts
+that rebuild it, the order to use them in, and what each one cannot give you.
 
 ---
 
@@ -816,6 +991,30 @@ Stated plainly rather than hidden.
     `evaluation/reports/`. It stays in the codebase because the mechanism is sound
     and a larger model is the variable that changed — not because it currently
     wins.
+13. **PDF table detection is a layout heuristic.** `PDF_TABLE_EXTRACTION_ENABLED`
+    is on by default because it measured better here (retrieval precision
+    .3115 → .3531, citation accuracy .551 → .5635, Q16 from P .33 to 1.00,
+    nothing else moved), but PyMuPDF is guessing at ruled regions, and on a
+    scanned or heavily ruled page it can mistake prose for a table. The words are
+    then read as a grid instead of as sentences — worse to read, not missing: a
+    word claimed by a candidate that is then rejected goes back to the page text,
+    and `scripts/selftest.py` checks word by word that nothing on the shipped deck
+    is withheld from the index. Two more limits worth knowing: a table that spans
+    a page break becomes one grid per page, and a table drawn as an image is OCR
+    text, not a grid.
+14. **Contextual retrieval is measured, and off.** `CONTEXTUAL_RETRIEVAL_ENABLED`
+    writes a situating blurb per chunk at ingest and prepends it to the text that is
+    embedded — never to the chunk, so it cannot reach a citation or a screen. On this
+    corpus at 0.5B it improved retrieval precision (.3531 → .3823), citation accuracy
+    (.5635 → .5740) and groundedness (.9375 → 1.0, hallucination .0625 → 0.0), and
+    lowered answer correctness (1.0 → .9792): one query answered both of its hops in
+    better prose and dropped the figure the dataset asks for. It also costs one
+    generation per chunk at ingest — 1089 s against 23 s for this corpus in a 2 GB
+    sandbox — and half the blurbs the 0.5B model wrote were refusals or restatements,
+    which are dropped rather than indexed. Both runs are in `evaluation/reports/`; the
+    variable that limited it is model size, so re-measure at 3B+ before believing
+    either column — `scripts/experiment_big_model.py` runs that re-measurement as
+    paired arms against the same model, and `BIG_MODEL_EXPERIMENT.md` is the protocol.
 
 ---
 
@@ -832,6 +1031,7 @@ EvidenceAI/
 │
 ├── documents.py            PDF / DOC / DOCX / TXT / CSV
 ├── chunking.py             fixed and structure-aware chunking
+├── contextual.py           per-chunk situating blurb for the indexed text (opt-in)
 ├── images.py               OCR + Qwen vision
 ├── ocr.py                  upscaling, confidence, digit filtering
 ├── audio.py                faster-whisper
@@ -856,6 +1056,7 @@ EvidenceAI/
 │
 ├── observability.py        stage trace + run manifest
 ├── chat_history.py         sessions, messages, stored traces
+├── rate_limit.py           token bucket for the routes that run models
 ├── auth.py                 local accounts, roles, lockout, API tokens
 ├── llm_judge.py            optional LLM-graded arm (unreliable on small models)
 ├── evaluation.py           16-query harness + regression gate
@@ -876,7 +1077,12 @@ EvidenceAI/
 │   ├── reindex.py          rebuild the whole index from data/
 │   ├── smoke_test.py       4 end-to-end questions + an abstention
 │   ├── verify_offline.py   offline proof with a socket guard
-│   ├── selftest.py         86 offline checks, no model or network
+│   ├── dump_chunks.py      see what a file becomes, without indexing it
+│   ├── selftest.py         258 offline checks, no model or network
+│   ├── apitest.py          78 checks on the API and the React UI it serves
+│   ├── build_kit.py        rebuild the archive, with a manifest of every sha256
+│   ├── verify_kit.py       prove an archive is complete — standard library only
+│   ├── experiment_big_model.py  paired-arm A/B harness for the opt-in features
 │   ├── calibrate_abstention.py  measure the threshold split on your corpus
 │   ├── create_user.py      accounts, roles, tokens
 │   └── manifest.py         print or write the run manifest
@@ -892,7 +1098,9 @@ EvidenceAI/
 │   ├── baseline.json            the gate baseline — never overwritten silently
 │   └── reports/                 versioned JSON + CSV + Markdown
 │
-├── README.md  DEMO_RUNBOOK.md  WINDOWS_SETUP_GUIDE.md  DEPLOYMENT.md
+├── README.md  DEMO_RUNBOOK.md  DEMO_CUE_CARD.md  WINDOWS_SETUP_GUIDE.md
+├── DEPLOYMENT.md  RECOVERY.md
+├── BIG_MODEL_EXPERIMENT.md  protocol for re-measuring the opt-in features at 3B+
 ├── READ_ME_FIRST.txt  .env.example
 ├── requirements.txt  requirements-lock.txt  packages.txt
 └── start.ps1  setup_windows.ps1  setup.ps1
